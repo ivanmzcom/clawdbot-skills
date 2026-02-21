@@ -139,7 +139,52 @@ cmd_rate(){ [[ $# -lt 2 ]]&&{ usage; exit 1; }; api_call POST "/rate/$1" "$(kv r
 cmd_unrate(){ [[ $# -lt 1 ]]&&{ usage; exit 1; }; api_call DELETE "/delete-rating/" "$(kv game_id "$1")"; }
 
 cmd_list_add(){ [[ $# -lt 2 ]]&&{ usage; exit 1; }; api_call POST "/api/list/quick/$1" "$(csv_to_repeat list_ids "$2")"; }
-cmd_list_create(){ [[ $# -lt 1 ]]&&{ usage; exit 1; }; api_call POST "/api/new-list/" "$(kv name "$1")"; }
+cmd_list_create(){
+  [[ $# -lt 1 ]]&&{ usage; exit 1; }
+  local name="$1"
+  require_auth
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[DRY-RUN] POST ${BASE_URL}/api/new-list/"
+    echo "[DRY-RUN] GET  <new_url> (parse list_id from .list-form#id)"
+    echo "[DRY-RUN] PUT  ${BASE_URL}/api/list/ data: $(kv list_id "<parsed>")&$(kv name "$name")"
+    return 0
+  fi
+
+  local resp status body new_url edit_html list_id
+  resp=$(curl -sS -X POST "${BASE_URL}/api/new-list/" "${auth_headers[@]}" -w $'\n__STATUS__:%{http_code}')
+  status=$(printf '%s' "$resp" | awk -F: '/__STATUS__/{print $2}' | tail -1)
+  body=$(printf '%s' "$resp" | sed '/__STATUS__:/d')
+  if [[ -z "$status" || "$status" -ge 400 ]]; then
+    echo "ERROR HTTP ${status:-unknown} en /api/new-list/" >&2
+    return 1
+  fi
+
+  new_url=$(python3 - <<'PY' "$body"
+import json,sys
+try:
+    j=json.loads(sys.argv[1])
+    print(j.get('new_url',''))
+except Exception:
+    print('')
+PY
+)
+  [[ -z "$new_url" ]] && { echo "ERROR: /api/new-list/ no devolvió new_url" >&2; return 1; }
+
+  edit_html=$(curl -sS "${BASE_URL}${new_url}" -H "Cookie: ${COOKIE}")
+  list_id=$(python3 - <<'PY' "$edit_html"
+import re,sys
+h=sys.argv[1]
+m=re.search(r'class="list-form"[^>]*\sid="([^"]+)"', h)
+if not m:
+    m=re.search(r'id="([^"]+)"[^>]*class="list-form"', h)
+print(m.group(1) if m else '')
+PY
+)
+  [[ -z "$list_id" ]] && { echo "ERROR: no pude extraer list_id desde ${new_url}" >&2; return 1; }
+
+  api_call PUT "/api/list/" "$(kv list_id "$list_id")&$(kv name "$name")"
+}
 cmd_list_update(){ [[ $# -lt 2 ]]&&{ usage; exit 1; }; api_call PUT "/api/list/" "$(kv list_id "$1")&$(kv name "$2")"; }
 cmd_list_delete(){ [[ $# -lt 1 ]]&&{ usage; exit 1; }; api_call DELETE "/api/list/" "$(kv list_id "$1")"; }
 cmd_list_stats(){ [[ $# -lt 1 ]]&&{ usage; exit 1; }; api_call PUT "/api/list/stats/" "$(kv list_id "$1")"; }
