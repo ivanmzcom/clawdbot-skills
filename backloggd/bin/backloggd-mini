@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_URL="https://backloggd.com"
+SERVICE="backloggd"
+
+need_bin() { command -v "$1" >/dev/null 2>&1 || { echo "Falta binario: $1" >&2; exit 1; }; }
+need_bin curl
+need_bin security
+need_bin python3
+
+kc() {
+  local account="$1"
+  security find-generic-password -s "$SERVICE" -a "$account" -w 2>/dev/null || true
+}
+
+USERNAME="$(kc username)"
+CSRF="$(kc csrf_token)"
+COOKIE="$(kc cookie_header)"
+
+auth_headers=(
+  -H "X-CSRF-Token: ${CSRF}"
+  -H "Cookie: ${COOKIE}"
+  -H "X-Requested-With: XMLHttpRequest"
+  -H "Accept: application/json, text/javascript, */*; q=0.01"
+  -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8"
+)
+
+require_auth() {
+  if [[ -z "${CSRF}" || -z "${COOKIE}" ]]; then
+    echo "Faltan csrf_token/cookie_header en keychain (servicio backloggd)." >&2
+    exit 1
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+backloggd-mini (bash)
+
+Uso:
+  backloggd-mini backlog [--sort campo] [--asc|--desc]
+  backloggd-mini log <game_id> <wishlist|backlog|playing|play>
+  backloggd-mini set-status <game_id> <status_id>
+  backloggd-mini rate <game_id> <rating>
+  backloggd-mini list-add <game_id> <list_ids_csv>
+  backloggd-mini help
+
+Sort campos típicos:
+  release, title, added, rating, user-rating, popular, trending,
+  time, avg-play-time, avg-finish-time, last_played, shuffle
+
+Status IDs (set-status):
+  0=Completed, 2=Abandoned, 3=Retired, 4=Shelved, 5=Played
+EOF
+}
+
+cmd_backlog() {
+  local sort="release" dir="asc"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --sort) sort="${2:-release}"; shift 2 ;;
+      --asc) dir="asc"; shift ;;
+      --desc) dir="desc"; shift ;;
+      *) echo "Arg no reconocido: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  if [[ -z "${USERNAME}" ]]; then
+    echo "Falta username en keychain (servicio backloggd, cuenta username)." >&2
+    exit 1
+  fi
+
+  local path="/u/${USERNAME}/backlog/${sort}/"
+  [[ "$dir" == "asc" ]] && path="/u/${USERNAME}/backlog/${sort}:asc/"
+
+  python3 - "${BASE_URL}${path}" <<'PY'
+import sys,re,html,urllib.request
+url=sys.argv[1]
+src=urllib.request.urlopen(url, timeout=30).read().decode('utf-8','ignore')
+pat=re.compile(r'<div class="card mx-auto game-cover [^"]*"[^>]*>.*?<img[^>]*alt="([^"]+)".*?</div>\s*</div>\s*<div class="row mx-0 release-below">\s*<p>([^<]+)</p>',re.S)
+rows=[]
+seen=set()
+for t,d in pat.findall(src):
+    title=html.unescape(t).strip()
+    date=html.unescape(d).strip()
+    if title in seen: continue
+    seen.add(title)
+    rows.append((date,title))
+for date,title in rows:
+    print(f"{date}\t{title}")
+PY
+}
+
+cmd_log() {
+  require_auth
+  local game_id="${1:-}" kind="${2:-}"
+  [[ -z "$game_id" || -z "$kind" ]] && { usage; exit 1; }
+  curl -s -X POST "${BASE_URL}/log/" "${auth_headers[@]}" \
+    --data "type=${kind}&game_id=${game_id}"
+  echo
+  echo "OK: log ${kind} para game_id=${game_id}"
+}
+
+cmd_set_status() {
+  require_auth
+  local game_id="${1:-}" status_id="${2:-}"
+  [[ -z "$game_id" || -z "$status_id" ]] && { usage; exit 1; }
+  curl -s -X PATCH "${BASE_URL}/log/status/" "${auth_headers[@]}" \
+    --data "game_id=${game_id}&status_id=${status_id}"
+  echo
+  echo "OK: status_id=${status_id} para game_id=${game_id}"
+}
+
+cmd_rate() {
+  require_auth
+  local game_id="${1:-}" rating="${2:-}"
+  [[ -z "$game_id" || -z "$rating" ]] && { usage; exit 1; }
+  curl -s -X POST "${BASE_URL}/rate/${game_id}" "${auth_headers[@]}" \
+    --data "rating=${rating}"
+  echo
+  echo "OK: rating=${rating} para game_id=${game_id}"
+}
+
+cmd_list_add() {
+  require_auth
+  local game_id="${1:-}" csv="${2:-}"
+  [[ -z "$game_id" || -z "$csv" ]] && { usage; exit 1; }
+  local data=""
+  IFS=',' read -r -a ids <<< "$csv"
+  for id in "${ids[@]}"; do
+    [[ -n "$id" ]] && data+="list_ids[]=${id}&"
+  done
+  data="${data%&}"
+  curl -s -X POST "${BASE_URL}/api/list/quick/${game_id}" "${auth_headers[@]}" --data "$data"
+  echo
+  echo "OK: game_id=${game_id} añadido a listas ${csv}"
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    backlog) cmd_backlog "$@" ;;
+    log) cmd_log "$@" ;;
+    set-status) cmd_set_status "$@" ;;
+    rate) cmd_rate "$@" ;;
+    list-add) cmd_list_add "$@" ;;
+    help|-h|--help) usage ;;
+    *) echo "Comando desconocido: $cmd" >&2; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
