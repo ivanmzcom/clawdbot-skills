@@ -244,7 +244,36 @@ Valores detectados en formularios:
 
 ---
 
-## 6) Seguridad
+## 6) Mini CLI (bash)
+
+Existe un mini CLI en:
+
+- Local workspace: `~/clawd/bin/backloggd-mini`
+- Repo skills: `backloggd/bin/backloggd-mini`
+
+Comandos implementados:
+
+```bash
+backloggd-mini backlog [--sort campo] [--asc|--desc]
+backloggd-mini log <game_id> <wishlist|backlog|playing|play>
+backloggd-mini set-status <game_id> <status_id>
+backloggd-mini rate <game_id> <rating>
+backloggd-mini list-add <game_id> <list_ids_csv>
+```
+
+Cobertura vs skill:
+
+- ✅ Backlog ordenado por campo
+- ✅ Crear logs básicos (`wishlist|backlog|playing|play`)
+- ✅ Cambiar estado de log
+- ✅ Puntuar juego
+- ✅ Quick add a listas
+- ❌ Crear/editar/borrar listas completas (`/api/list`)
+- ❌ Carpetas de listas (`/api/list/folder`)
+- ❌ Social (likes, comments, report)
+- ❌ Widgets
+
+## 7) Seguridad
 
 - Nunca guardar cookies/tokens en texto plano en repo.
 - Guardar en Keychain y refrescar cuando caduquen.
