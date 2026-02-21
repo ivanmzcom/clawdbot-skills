@@ -10,11 +10,11 @@ Direct curl calls to Trakt.tv API. No CLI dependency needed.
 ## API Details
 
 - **Base URL:** `https://api.trakt.tv`
-- **Client ID:** keychain (`security find-generic-password -s trakt-cli -a client_id -w`)
-- **Client Secret:** keychain (`security find-generic-password -s trakt-cli -a client_secret -w`)
-- **Access Token:** keychain (`security find-generic-password -s trakt-cli -a access_token -w`)
-- **Refresh Token:** keychain (`security find-generic-password -s trakt-cli -a refresh_token -w`)
-- **Token Expiry:** `~/.config/trakt-cli/config.json` → `expiresAt` (epoch ms)
+- **Client ID:** keychain (`security find-generic-password -s trakt -a client_id -w`)
+- **Client Secret:** keychain (`security find-generic-password -s trakt -a client_secret -w`)
+- **Access Token:** keychain (`security find-generic-password -s trakt -a access_token -w`)
+- **Refresh Token:** keychain (`security find-generic-password -s trakt -a refresh_token -w`)
+- **Token Expiry:** `~/.config/trakt/config.json` → `expiresAt` (epoch ms)
 
 ## Authentication
 
@@ -23,9 +23,9 @@ Tokens are already stored in Keychain. Before each request, check if the token n
 ### Refresh token (if expired)
 
 ```bash
-TRAKT_CLIENT_ID="$(security find-generic-password -s trakt-cli -a client_id -w)"
-TRAKT_CLIENT_SECRET="$(security find-generic-password -s trakt-cli -a client_secret -w)"
-REFRESH_TOKEN=$(security find-generic-password -s trakt-cli -a refresh_token -w)
+TRAKT_CLIENT_ID="$(security find-generic-password -s trakt -a client_id -w)"
+TRAKT_CLIENT_SECRET="$(security find-generic-password -s trakt -a client_secret -w)"
+REFRESH_TOKEN=$(security find-generic-password -s trakt -a refresh_token -w)
 
 RESPONSE=$(curl -s -X POST "https://api.trakt.tv/oauth/token" \
   -H "Content-Type: application/json" \
@@ -37,9 +37,9 @@ CREATED=$(echo "$RESPONSE" | jq -r '.created_at')
 EXPIRES_IN=$(echo "$RESPONSE" | jq -r '.expires_in')
 EXPIRES_AT=$(( (CREATED + EXPIRES_IN) * 1000 ))
 
-security add-generic-password -U -s trakt-cli -a access_token -w "$NEW_ACCESS"
-security add-generic-password -U -s trakt-cli -a refresh_token -w "$NEW_REFRESH"
-echo "{\"expiresAt\":$EXPIRES_AT}" > ~/.config/trakt-cli/config.json
+security add-generic-password -U -s trakt -a access_token -w "$NEW_ACCESS"
+security add-generic-password -U -s trakt -a refresh_token -w "$NEW_REFRESH"
+echo "{\"expiresAt\":$EXPIRES_AT}" > ~/.config/trakt/config.json
 ```
 
 ## Making Requests
@@ -47,8 +47,8 @@ echo "{\"expiresAt\":$EXPIRES_AT}" > ~/.config/trakt-cli/config.json
 All authenticated requests need these headers:
 
 ```bash
-TRAKT_TOKEN=$(security find-generic-password -s trakt-cli -a access_token -w)
-TRAKT_CLIENT_ID="$(security find-generic-password -s trakt-cli -a client_id -w)"
+TRAKT_TOKEN=$(security find-generic-password -s trakt -a access_token -w)
+TRAKT_CLIENT_ID="$(security find-generic-password -s trakt -a client_id -w)"
 
 curl -s "https://api.trakt.tv/ENDPOINT" \
   -H "Content-Type: application/json" \
@@ -60,8 +60,8 @@ curl -s "https://api.trakt.tv/ENDPOINT" \
 ## Upcoming Episodes
 
 ```bash
-TRAKT_TOKEN=$(security find-generic-password -s trakt-cli -a access_token -w)
-TRAKT_CLIENT_ID="$(security find-generic-password -s trakt-cli -a client_id -w)"
+TRAKT_TOKEN=$(security find-generic-password -s trakt -a access_token -w)
+TRAKT_CLIENT_ID="$(security find-generic-password -s trakt -a client_id -w)"
 TODAY=$(date "+%Y-%m-%d")
 DAYS=7
 
@@ -135,7 +135,7 @@ for item in json.load(sys.stdin):
 Before making requests, check if token is expired:
 
 ```bash
-EXPIRES_AT=$(python3 -c "import json; print(json.load(open('$HOME/.config/trakt-cli/config.json')).get('expiresAt',0))")
+EXPIRES_AT=$(python3 -c "import json; print(json.load(open('$HOME/.config/trakt/config.json')).get('expiresAt',0))")
 NOW_MS=$(python3 -c "import time; print(int(time.time()*1000))")
 if [ "$NOW_MS" -ge "$EXPIRES_AT" ]; then
   echo "Token expired, refreshing..."
