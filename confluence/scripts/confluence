@@ -1,0 +1,409 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Colors (disabled if not a terminal)
+if [ -t 1 ]; then
+    RED=$'\033[0;31m'
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[0;33m'
+    BLUE=$'\033[0;34m'
+    CYAN=$'\033[0;36m'
+    GRAY=$'\033[0;90m'
+    BOLD=$'\033[1m'
+    NC=$'\033[0m'
+else
+    RED='' GREEN='' YELLOW='' BLUE='' CYAN='' GRAY='' BOLD='' NC=''
+fi
+
+source "${SCRIPT_DIR}/config.sh"
+
+# Print functions
+print_error() { printf "${RED}Error:${NC} %s\n" "$1" >&2; }
+print_success() { printf "${GREEN}✓${NC} %s\n" "$1"; }
+print_info() { printf "${BLUE}ℹ${NC} %s\n" "$1"; }
+
+# API functions
+api_request() {
+    local endpoint="$1"
+    local url token
+
+    url=$(config_get_url)
+    token=$(config_get_token)
+
+    url="${url%/}/rest/api${endpoint}"
+
+    local response http_code
+    response=$(curl -s -w "\n%{http_code}" \
+        -H "Authorization: Bearer ${token}" \
+        -H "Accept: application/json" \
+        "$url")
+
+    http_code=$(echo "$response" | tail -1)
+    response=$(echo "$response" | sed '$d')
+
+    if [ "$http_code" -ge 400 ] 2>/dev/null; then
+        print_error "API error: HTTP ${http_code}"
+        exit 1
+    fi
+
+    echo "$response"
+}
+
+# URL parsing
+parse_confluence_url() {
+    local url="$1"
+    local path query page_id space_key page_title
+
+    # Extract pageId from query string
+    if [[ "$url" == *"pageId="* ]]; then
+        page_id=$(echo "$url" | sed -n 's/.*pageId=\([0-9]*\).*/\1/p')
+        echo "id:${page_id}"
+        return
+    fi
+
+    # Extract path
+    path=$(echo "$url" | sed 's|https\?://[^/]*||')
+
+    # /spaces/SPACE/pages/ID/...
+    if [[ "$path" =~ /spaces/([^/]+)/pages/([0-9]+) ]]; then
+        echo "id:${BASH_REMATCH[2]}"
+        return
+    fi
+
+    # /display/SPACE/Title
+    if [[ "$path" =~ /display/([^/]+)/(.+) ]]; then
+        space_key="${BASH_REMATCH[1]}"
+        page_title=$(printf '%b' "${BASH_REMATCH[2]//+/ }" | python3 -c "import sys,urllib.parse;print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null || echo "${BASH_REMATCH[2]}")
+        echo "title:${space_key}:${page_title}"
+        return
+    fi
+
+    echo ""
+}
+
+# Command functions
+cmd_config() {
+    local show_only=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --show) show_only=true; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    if [ "$show_only" = true ]; then
+        echo "${GRAY}Config file:${NC} ${CONFIG_FILE}"
+        if config_validate 2>/dev/null; then
+            local url username
+            url=$(config_get_url)
+            username=$(config_get_username)
+            echo "${GRAY}URL:${NC}      ${url}"
+            echo "${GRAY}Username:${NC} ${username}"
+            echo "${GRAY}Token:${NC}    ****"
+        else
+            echo "${GRAY}Status:${NC}   Not configured"
+        fi
+        return
+    fi
+
+    echo "${BOLD}Confluence CLI Configuration${NC}"
+    echo ""
+
+    read -p "${CYAN}Confluence URL: ${NC}" url
+    read -p "${CYAN}Username: ${NC}" username
+    read -p "${CYAN}API Token: ${NC}" token
+
+    if [ -z "$url" ] || [ -z "$username" ] || [ -z "$token" ]; then
+        print_error "All fields are required."
+        exit 1
+    fi
+
+    config_save "$url" "$username" "$token"
+    print_success "Configuration saved."
+}
+
+cmd_spaces() {
+    local limit=25
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -l|--limit) limit="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    config_require
+
+    local response
+    response=$(api_request "/space?limit=${limit}&expand=description.plain")
+
+    local count
+    count=$(echo "$response" | jq -r '.size')
+
+    echo ""
+    echo "${BOLD}Spaces (${count}):${NC}"
+    echo ""
+
+    echo "$response" | jq -r '.results[] | "\(.key)\t\(.name)\t\(.description.plain.value // "")"' | while IFS=$'\t' read -r key name desc; do
+        echo "${CYAN}${key}${NC} - ${name}"
+        if [ -n "$desc" ]; then
+            echo "  ${GRAY}${desc:0:80}${NC}"
+        fi
+    done
+    echo ""
+}
+
+cmd_search() {
+    local query="" space="" limit=10
+
+    if [ $# -gt 0 ] && [[ "$1" != -* ]]; then
+        query="$1"
+        shift
+    fi
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -s|--space) space="$2"; shift 2 ;;
+            -l|--limit) limit="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    if [ -z "$query" ]; then
+        print_error "Search query required."
+        exit 1
+    fi
+
+    config_require
+
+    # Build CQL
+    local cql
+    if [[ "$query" == *"="* ]] || [[ "$query" == *"~"* ]]; then
+        cql="$query"
+    else
+        cql="text ~ \"${query}\""
+    fi
+
+    if [ -n "$space" ]; then
+        cql="(${cql}) AND space = \"${space}\""
+    fi
+
+    cql="(${cql}) AND type = page"
+
+    local encoded_cql
+    encoded_cql=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${cql}'))" 2>/dev/null || echo "$cql")
+
+    local response
+    response=$(api_request "/content/search?cql=${encoded_cql}&limit=${limit}&expand=space")
+
+    local size total
+    size=$(echo "$response" | jq -r '.size')
+    total=$(echo "$response" | jq -r '.totalSize // .size')
+
+    echo ""
+    echo "${BOLD}Results: ${size} of ${total}${NC}"
+    echo ""
+
+    local base_url
+    base_url=$(config_get_url)
+    base_url="${base_url%/}"
+
+    echo "$response" | jq -r '.results[] | "\(.id)\t\(.title)\t\(.space.key)\t\(._links.webui)"' | while IFS=$'\t' read -r id title space_key webui; do
+        echo "${GREEN}[${id}]${NC} ${title}"
+        echo "  ${GRAY}Space: ${space_key} | URL: ${base_url}${webui}${NC}"
+    done
+    echo ""
+}
+
+cmd_page() {
+    local page_id="" format="markdown"
+
+    if [ $# -gt 0 ] && [[ "$1" != -* ]]; then
+        page_id="$1"
+        shift
+    fi
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f|--format) format="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    if [ -z "$page_id" ]; then
+        print_error "Page ID required."
+        exit 1
+    fi
+
+    config_require
+    print_page "$page_id" "$format"
+}
+
+cmd_url() {
+    local url="" format="markdown"
+
+    if [ $# -gt 0 ] && [[ "$1" != -* ]]; then
+        url="$1"
+        shift
+    fi
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f|--format) format="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    if [ -z "$url" ]; then
+        print_error "URL required."
+        exit 1
+    fi
+
+    config_require
+
+    local parsed
+    parsed=$(parse_confluence_url "$url")
+
+    if [ -z "$parsed" ]; then
+        print_error "Could not parse URL: ${url}"
+        exit 1
+    fi
+
+    local type="${parsed%%:*}"
+    local rest="${parsed#*:}"
+
+    if [ "$type" = "id" ]; then
+        print_page "$rest" "$format"
+    elif [ "$type" = "title" ]; then
+        local space_key="${rest%%:*}"
+        local page_title="${rest#*:}"
+        # Search by title
+        local encoded_cql
+        encoded_cql=$(python3 -c "import urllib.parse; print(urllib.parse.quote('title = \"${page_title}\" AND space = \"${space_key}\" AND type = page'))" 2>/dev/null)
+
+        local response
+        response=$(api_request "/content/search?cql=${encoded_cql}&limit=1&expand=body.storage,space,version")
+
+        local count
+        count=$(echo "$response" | jq -r '.size')
+
+        if [ "$count" = "0" ]; then
+            print_error "Page not found: \"${page_title}\" in space \"${space_key}\""
+            exit 1
+        fi
+
+        local page_id
+        page_id=$(echo "$response" | jq -r '.results[0].id')
+        display_page_data "$(echo "$response" | jq '.results[0]')" "$format"
+    fi
+}
+
+print_page() {
+    local page_id="$1"
+    local format="$2"
+
+    local response
+    response=$(api_request "/content/${page_id}?expand=body.storage,space,version")
+    display_page_data "$response" "$format"
+}
+
+display_page_data() {
+    local page="$1"
+    local format="$2"
+
+    local title space_key space_name page_id version modified webui
+    title=$(echo "$page" | jq -r '.title')
+    space_key=$(echo "$page" | jq -r '.space.key')
+    space_name=$(echo "$page" | jq -r '.space.name')
+    page_id=$(echo "$page" | jq -r '.id')
+    version=$(echo "$page" | jq -r '.version.number // empty')
+    modified=$(echo "$page" | jq -r '.version.when // empty')
+    webui=$(echo "$page" | jq -r '._links.webui // empty')
+
+    local base_url
+    base_url=$(config_get_url)
+    base_url="${base_url%/}"
+
+    echo ""
+    echo "${BOLD}${CYAN}# ${title}${NC}"
+    echo ""
+    echo "${GRAY}Space: ${space_key} (${space_name})${NC}"
+    echo "${GRAY}ID: ${page_id}${NC}"
+    if [ -n "$version" ]; then
+        echo "${GRAY}Version: ${version}${NC}"
+    fi
+    if [ -n "$modified" ]; then
+        echo "${GRAY}Modified: ${modified}${NC}"
+    fi
+    if [ -n "$webui" ]; then
+        echo "${GRAY}URL: ${base_url}${webui}${NC}"
+    fi
+    echo "${GRAY}$(printf '─%.0s' {1..60})${NC}"
+    echo ""
+
+    local html_content
+    html_content=$(echo "$page" | jq -r '.body.storage.value // ""')
+
+    if [ -z "$html_content" ]; then
+        print_info "Page has no content."
+        return
+    fi
+
+    if [ "$format" = "html" ]; then
+        echo "$html_content"
+    else
+        # Convert HTML to markdown using pandoc
+        if command -v pandoc &>/dev/null; then
+            echo "$html_content" | pandoc -f html -t markdown --wrap=none 2>/dev/null
+        else
+            # Fallback: strip tags with sed
+            echo "$html_content" | sed 's/<[^>]*>//g; s/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&nbsp;/ /g'
+        fi
+    fi
+    echo ""
+}
+
+# Help
+show_help() {
+    echo "confluence - Confluence CLI"
+    echo ""
+    echo "Usage: confluence <command> [options]"
+    echo ""
+    echo "Commands:"
+    echo "  config [--show]                     Configure URL, username, token"
+    echo "  spaces [-l limit]                   List spaces"
+    echo "  search <query> [-s space] [-l limit] Search pages (CQL)"
+    echo "  page <id> [-f html|markdown]        View page by ID"
+    echo "  url <url> [-f html|markdown]        View page by URL"
+    echo ""
+}
+
+# Main dispatcher
+main() {
+    if [ $# -eq 0 ]; then
+        show_help
+        exit 0
+    fi
+
+    local cmd="$1"
+    shift
+
+    case "$cmd" in
+        -h|--help|help) show_help ;;
+        config)         cmd_config "$@" ;;
+        spaces)         cmd_spaces "$@" ;;
+        search)         cmd_search "$@" ;;
+        page)           cmd_page "$@" ;;
+        url)            cmd_url "$@" ;;
+        *)
+            print_error "Unknown command: $cmd"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

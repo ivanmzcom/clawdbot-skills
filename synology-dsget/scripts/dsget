@@ -1,0 +1,1309 @@
+#!/bin/bash
+# dsget - Synology NAS CLI (bash port)
+# Compatible with Synology Download Station and File Station
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# CONFIG_FILE is defined in config.sh
+
+# Colors (disabled if not a terminal)
+if [ -t 1 ]; then
+    RED=$'\033[0;31m'
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[0;33m'
+    BLUE=$'\033[0;34m'
+    CYAN=$'\033[0;36m'
+    WHITE=$'\033[0;37m'
+    MAGENTA=$'\033[0;35m'
+    BOLD=$'\033[1m'
+    NC=$'\033[0m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    CYAN=''
+    WHITE=''
+    MAGENTA=''
+    BOLD=''
+    NC=''
+fi
+
+# Source config helper
+source "${SCRIPT_DIR}/config.sh"
+
+# Print functions
+print_error() { printf "${RED}Error:${NC} %s\n" "$1" >&2; }
+print_success() { printf "${GREEN}✓${NC} %s\n" "$1"; }
+print_info() { printf "${BLUE}ℹ${NC} %s\n" "$1"; }
+print_warning() { printf "${YELLOW}Warning:${NC} %s\n" "$1" >&2; }
+
+# URL encode a string
+url_encode() {
+    local string="$1"
+    printf '%s' "$string" | python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=''))" 2>/dev/null || echo "$string"
+}
+
+# Build base URL
+build_base_url() {
+    local host="$1"
+    local port="$2"
+    local use_https="$3"
+    
+    if [ "$use_https" = "true" ]; then
+        if [ "$port" = "443" ]; then
+            echo "https://${host}"
+        else
+            echo "https://${host}:${port}"
+        fi
+    else
+        echo "http://${host}:${port}"
+    fi
+}
+
+# API functions
+api_request() {
+    local endpoint="$1"
+    local method="${2:-GET}"
+    local data="${3:-}"
+    
+    local server
+    server=$(config_get_server)
+    if [ -z "$server" ]; then
+        print_error "Not logged in. Use 'dsget login' first."
+        exit 1
+    fi
+    
+    local host port use_https sid
+    host=$(echo "$server" | jq -r '.server.config.host // .config.host')
+    port=$(echo "$server" | jq -r '.server.config.port // .config.port')
+    use_https=$(echo "$server" | jq -r '.server.config.useHTTPS // .config.useHTTPS')
+    sid=$(echo "$server" | jq -r '.server.config.sid // .config.sid')
+    
+    local base_url
+    base_url=$(build_base_url "$host" "$port" "$use_https")
+    
+    local url="${base_url}${endpoint}"
+    local extra_args=("-s" "-S")
+    
+    # Build query string
+    local query=""
+    if [ -n "$data" ]; then
+        query="$data"
+    fi
+    if [ -n "$sid" ]; then
+        if [ -n "$query" ]; then
+            query="${query}&_sid=${sid}"
+        else
+            query="_sid=${sid}"
+        fi
+    fi
+    
+    # Append query to URL
+    if [ -n "$query" ]; then
+        if [[ "$url" == *"?"* ]]; then
+            url="${url}&${query}"
+        else
+            url="${url}?${query}"
+        fi
+    fi
+    
+    if [ "$method" = "POST" ]; then
+        extra_args+=("-X" "POST" "--data-urlencode" "payload@/dev/stdin")
+        curl "${extra_args[@]}" -k "$url" <<< ""
+    else
+        curl "${extra_args[@]}" -k "$url"
+    fi
+}
+
+api_login() {
+    local host="$1"
+    local port="$2"
+    local use_https="$3"
+    local username="$4"
+    local password="$5"
+    
+    local base_url
+    base_url=$(build_base_url "$host" "$port" "$use_https")
+    
+    local encoded_password
+    encoded_password=$(url_encode "$password")
+
+    local url="${base_url}/webapi/entry.cgi?api=SYNO.API.Auth&method=login&version=7&account=${username}&passwd=${encoded_password}&session=DownloadStation&format=sid"
+    
+    local response
+    response=$(curl -s -S -k "$url")
+    
+    local success
+    success=$(echo "$response" | jq -r '.success')
+    
+    if [ "$success" != "true" ]; then
+        local error_code
+        error_code=$(echo "$response" | jq -r '.error.code // 0')
+        print_error "Login failed (error code: $error_code)"
+        exit 1
+    fi
+    
+    local sid
+    sid=$(echo "$response" | jq -r '.data.sid')
+    
+    # Save config (password goes to Keychain)
+    config_save "$host" "$port" "$use_https" "$sid" "$username" "$password"
+    
+    print_success "Logged in successfully to ${host}"
+    print_info "Session ID: ${sid:0:8}..."
+}
+
+api_logout() {
+    local server
+    server=$(config_get_server)
+    if [ -z "$server" ]; then
+        print_error "Not logged in."
+        exit 1
+    fi
+    
+    local host port use_https sid
+    host=$(echo "$server" | jq -r '.server.config.host // .config.host')
+    port=$(echo "$server" | jq -r '.server.config.port // .config.port')
+    use_https=$(echo "$server" | jq -r '.server.config.useHTTPS // .config.useHTTPS')
+    sid=$(echo "$server" | jq -r '.server.config.sid // .config.sid')
+    
+    local base_url
+    base_url=$(build_base_url "$host" "$port" "$use_https")
+    
+    local url="${base_url}/webapi/auth.cgi?api=SYNO.API.Auth&method=logout&version=1&session=DownloadStation&_sid=${sid}"
+    
+    curl -s -S -k "$url" || true
+    
+    config_clear_session
+    print_success "Logged out from ${host}"
+}
+
+# Task functions
+cmd_tasks_list() {
+    local verbose="$1"
+    local status_filter="$2"
+    
+    ensure_auth
+    
+    local response
+    response=$(api_request "/webapi/DownloadStation/task.cgi" "GET" "api=SYNO.DownloadStation.Task&method=list&version=1&additional=detail,transfer,file")
+    
+    local tasks
+    tasks=$(echo "$response" | jq -c '.data.tasks[]')
+    
+    if [ -z "$tasks" ] || [ "$tasks" = "[]" ]; then
+        print_info "No download tasks found"
+        return
+    fi
+    
+    # Filter by status if requested
+    if [ -n "$status_filter" ]; then
+        tasks=$(echo "$tasks" | jq --arg status "$status_filter" 'select(.status | ascii_downcase == $status)')
+    fi
+    
+    local count=0 downloading=0 paused=0 finished=0 seeding=0
+    
+    if [ "$verbose" = "true" ]; then
+        echo "$tasks" | while read -r task; do
+            print_task_verbose "$task"
+            echo ""
+        done
+        count=$(echo "$tasks" | jq -s 'length')
+        downloading=$(echo "$tasks" | jq -s '[.[] | select(.status | ascii_downcase == "downloading")] | length')
+        paused=$(echo "$tasks" | jq -s '[.[] | select(.status | ascii_downcase == "paused")] | length')
+        finished=$(echo "$tasks" | jq -s '[.[] | select(.status | ascii_downcase == "finished")] | length')
+        seeding=$(echo "$tasks" | jq -s '[.[] | select(.status | ascii_downcase == "seeding")] | length')
+    else
+        print_tasks_table "$tasks"
+        count=$(echo "$tasks" | jq -s 'length')
+        downloading=$(echo "$tasks" | jq -s '[.[] | select(.status | ascii_downcase == "downloading")] | length')
+        paused=$(echo "$tasks" | jq -s '[.[] | select(.status | ascii_downcase == "paused")] | length')
+        finished=$(echo "$tasks" | jq -s '[.[] | select(.status | ascii_downcase == "finished")] | length')
+        seeding=$(echo "$tasks" | jq -s '[.[] | select(.status | ascii_downcase == "seeding")] | length')
+    fi
+    
+    echo ""
+    echo "Total: ${count} | Downloading: ${downloading} | Paused: ${paused} | Finished: ${finished} | Seeding: ${seeding}"
+}
+
+cmd_tasks_add() {
+    local uri="$1"
+    local destination="$2"
+    
+    ensure_auth
+    
+    local server
+    server=$(config_get_server)
+    local host port use_https sid
+    host=$(echo "$server" | jq -r '.server.config.host // .config.host')
+    port=$(echo "$server" | jq -r '.server.config.port // .config.port')
+    use_https=$(echo "$server" | jq -r '.server.config.useHTTPS // .config.useHTTPS')
+    sid=$(echo "$server" | jq -r '.server.config.sid // .config.sid')
+    
+    local base_url
+    base_url=$(build_base_url "$host" "$port" "$use_https")
+    
+    # Check if local file - use JS CLI which handles multipart correctly
+    if [ -f "$uri" ]; then
+        print_info "Uploading torrent file..."
+        
+        # Get JS CLI path (absolute)
+        local js_cli="/Users/ivan/clawd/projects/dsget-cli/dist/index.js"
+        
+        # Build command (without extra quotes)
+        local cmd="node ${js_cli} tasks add ${uri}"
+        if [ -n "$destination" ]; then
+            cmd="${cmd} -d ${destination}"
+        fi
+        
+        # Execute via JS CLI
+        local response
+        response=$(cd /Users/ivan/clawd/projects/dsget-cli && $cmd 2>&1)
+        
+        # Check for errors
+        if echo "$response" | grep -q "Error:"; then
+            print_error "Failed to add task"
+            echo "$response" >&2
+            exit 1
+        else
+            print_success "Task added successfully"
+        fi
+        return
+    fi
+    
+    # URL or magnet link - use built-in curl (this works)
+    local encoded_uri=$(url_encode "$uri")
+    local url="${base_url}/webapi/DownloadStation/task.cgi?api=SYNO.DownloadStation.Task&method=create&version=1&uri=${encoded_uri}&_sid=${sid}"
+    if [ -n "$destination" ]; then
+        local encoded_dest=$(url_encode "$destination")
+        url="${url}&destination=${encoded_dest}"
+    fi
+    
+    local response
+    response=$(curl -s -S -k "$url")
+    
+    local success
+    success=$(echo "$response" | jq -r '.success')
+    
+    if [ "$success" = "true" ]; then
+        print_success "Task added successfully"
+    else
+        print_error "Failed to add task"
+        exit 1
+    fi
+}
+
+cmd_tasks_pause() {
+    local ids="$1"
+    
+    ensure_auth
+    
+    if [ "$ids" = "all" ]; then
+        ids=$(get_all_task_ids)
+    fi
+    
+    local response
+    response=$(api_request "/webapi/DownloadStation/task.cgi" "POST" "api=SYNO.DownloadStation.Task&method=pause&version=1&id=${ids}")
+    
+    local success
+    success=$(echo "$response" | jq -r '.success')
+    
+    if [ "$success" = "true" ]; then
+        print_success "Task(s) paused"
+    else
+        print_error "Failed to pause task(s)"
+        exit 1
+    fi
+}
+
+cmd_tasks_resume() {
+    local ids="$1"
+    
+    ensure_auth
+    
+    if [ "$ids" = "all" ]; then
+        ids=$(get_all_task_ids)
+    fi
+    
+    local response
+    response=$(api_request "/webapi/DownloadStation/task.cgi" "POST" "api=SYNO.DownloadStation.Task&method=resume&version=1&id=${ids}")
+    
+    local success
+    success=$(echo "$response" | jq -r '.success')
+    
+    if [ "$success" = "true" ]; then
+        print_success "Task(s) resumed"
+    else
+        print_error "Failed to resume task(s)"
+        exit 1
+    fi
+}
+
+cmd_tasks_delete() {
+    local ids="$1"
+    local force="$2"
+    
+    ensure_auth
+    
+    if [ "$force" != "true" ]; then
+        read -p "Are you sure you want to delete task(s)? [y/N]: " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            print_info "Cancelled"
+            return
+        fi
+    fi
+    
+    local response
+    response=$(api_request "/webapi/DownloadStation/task.cgi" "POST" "api=SYNO.DownloadStation.Task&method=delete&version=1&id=${ids}")
+    
+    local success
+    success=$(echo "$response" | jq -r '.success')
+    
+    if [ "$success" = "true" ]; then
+        print_success "Task(s) deleted"
+    else
+        print_error "Failed to delete task(s)"
+        exit 1
+    fi
+}
+
+cmd_tasks_info() {
+    local id="$1"
+    
+    ensure_auth
+    
+    local response
+    response=$(api_request "/webapi/DownloadStation/task.cgi" "GET" "api=SYNO.DownloadStation.Task&method=getinfo&version=1&id=${id}&additional=detail,transfer,file,tracker")
+    
+    local task
+    task=$(echo "$response" | jq -r '.data.tasks[0]')
+    
+    if [ "$task" = "null" ]; then
+        print_error "Task not found"
+        exit 1
+    fi
+    
+    print_task_verbose "$task"
+}
+
+# File functions
+cmd_files_ls() {
+    local path="${1:-}"
+    local long="$2"
+    local all="$3"
+    
+    ensure_auth
+    
+    # If no path, list shares
+    if [ -z "$path" ] || [ "$path" = "/" ]; then
+        cmd_files_shares "$long"
+        return
+    fi
+    
+    local server
+    server=$(config_get_server)
+    local host port use_https sid
+    host=$(echo "$server" | jq -r '.server.config.host // .config.host')
+    port=$(echo "$server" | jq -r '.server.config.port // .config.port')
+    use_https=$(echo "$server" | jq -r '.server.config.useHTTPS // .config.useHTTPS')
+    sid=$(echo "$server" | jq -r '.server.config.sid // .config.sid')
+    
+    local base_url
+    base_url=$(build_base_url "$host" "$port" "$use_https")
+    
+    # URL encode path
+    local encoded_path
+    encoded_path=$(url_encode "$path")
+    
+    local url="${base_url}/webapi/entry.cgi?api=SYNO.FileStation.List&method=list&version=2&folder_path=${encoded_path}&filetype=all&additional=real_path,size,time&_sid=${sid}"
+    
+    local response
+    response=$(curl -s -S -k "$url")
+    
+    local success
+    success=$(echo "$response" | jq -r '.success')
+    
+    if [ "$success" != "true" ]; then
+        print_error "Failed to list files"
+        exit 1
+    fi
+    
+    local files
+    files=$(echo "$response" | jq -c '.data.files[]')
+    
+    if [ -z "$files" ] || [ "$files" = "[]" ]; then
+        print_info "Empty folder"
+        return
+    fi
+    
+    # Filter hidden files
+    if [ "$all" != "true" ]; then
+        files=$(echo "$files" | jq -c 'select(.name | startswith(".") | not)')
+    fi
+    
+    local file_count=0 dir_count=0
+    if [ "$long" = "true" ]; then
+        print_files_long "$files"
+    else
+        print_files_short "$files"
+    fi
+    
+    file_count=$(echo "$files" | jq -s 'length')
+    dir_count=$(echo "$files" | jq -s '[.[] | select(.isdir == true)] | length')
+    local regular_files=$((file_count - dir_count))
+    
+    echo ""
+    echo "Total: ${file_count} (${dir_count} folders, ${regular_files} files)"
+}
+
+cmd_files_shares() {
+    local long="$1"
+    
+    ensure_auth
+    
+    local response
+    response=$(api_request "/webapi/entry.cgi" "GET" "api=SYNO.FileStation.List&method=list_share&version=2&additional=real_path,size")
+    
+    local success
+    success=$(echo "$response" | jq -r '.success')
+    
+    if [ "$success" != "true" ]; then
+        print_error "Failed to list shares"
+        exit 1
+    fi
+    
+    local shares
+    shares=$(echo "$response" | jq -c '.data.shares[]')
+    
+    if [ -z "$shares" ] || [ "$shares" = "[]" ]; then
+        print_info "No shared folders found"
+        return
+    fi
+    
+    print_shares_list "$shares" "$long"
+}
+
+cmd_files_mkdir() {
+    local path="$1"
+    local name="$2"
+    
+    ensure_auth
+    
+    # URL encode path and name
+    local encoded_path encoded_name
+    encoded_path=$(url_encode "$path")
+    encoded_name=$(url_encode "$name")
+    
+    local response
+    response=$(api_request "/webapi/entry.cgi" "POST" "api=SYNO.FileStation.CreateFolder&method=create&version=2&folder_path=${encoded_path}&name=${encoded_name}")
+    
+    local success
+    success=$(echo "$response" | jq -r '.success')
+    
+    if [ "$success" = "true" ]; then
+        print_success "Folder created: ${path}/${name}"
+    else
+        print_error "Failed to create folder"
+        exit 1
+    fi
+}
+
+cmd_files_info() {
+    local path="$1"
+    
+    ensure_auth
+    
+    # URL encode path
+    local encoded_path
+    encoded_path=$(url_encode "$path")
+    
+    local response
+    response=$(api_request "/webapi/entry.cgi" "GET" "api=SYNO.FileStation.List&method=getinfo&version=2&path=${encoded_path}&additional=real_path,size,time,owner")
+    
+    local success
+    success=$(echo "$response" | jq -r '.success')
+    
+    if [ "$success" != "true" ]; then
+        print_error "File not found"
+        exit 1
+    fi
+    
+    local file
+    file=$(echo "$response" | jq -r '.data.files[0]')
+    
+    echo -e "${BOLD}File Information${NC}"
+    echo "──────────────────────────────────────────────────"
+    echo -e "${BOLD}Name:${NC} $(echo "$file" | jq -r '.name')"
+    echo -e "${BOLD}Path:${NC} $(echo "$file" | jq -r '.path')"
+    echo -e "${BOLD}Type:${NC} $(echo "$file" | jq -r 'if .isdir then "Directory" else "File" end')"
+    
+    local size additional
+    additional=$(echo "$file" | jq -r '.additional // {}')
+    size=$(echo "$additional" | jq -r '.size // 0')
+    if [ "$size" != "null" ] && [ "$size" -gt 0 ] 2>/dev/null; then
+        if [ "$(echo "$file" | jq -r '.isdir')" != "true" ]; then
+            echo -e "${BOLD}Size:${NC} $(format_size "$size")"
+        fi
+    fi
+    
+    local real_path
+    real_path=$(echo "$additional" | jq -r '.real_path // empty')
+    if [ -n "$real_path" ]; then
+        echo -e "${BOLD}Real Path:${NC} $real_path"
+    fi
+    
+    local mtime
+    mtime=$(echo "$additional" | jq -r '.time.mtime // empty')
+    if [ -n "$mtime" ] && [ "$mtime" != "null" ]; then
+        echo -e "${BOLD}Modified:${NC} $(format_date "$mtime")"
+    fi
+    
+    local crtime
+    crtime=$(echo "$additional" | jq -r '.time.crtime // empty')
+    if [ -n "$crtime" ] && [ "$crtime" != "null" ]; then
+        echo -e "${BOLD}Created:${NC} $(format_date "$crtime")"
+    fi
+}
+
+# Feed functions
+cmd_feeds_list() {
+    ensure_auth
+    
+    local response
+    response=$(api_request "/webapi/DownloadStation/RSSsite.cgi" "GET" "api=SYNO.DownloadStation.RSS.Site&method=list&version=1")
+    
+    local success
+    success=$(echo "$response" | jq -r '.success')
+    
+    if [ "$success" != "true" ]; then
+        print_error "Failed to list feeds"
+        exit 1
+    fi
+    
+    local feeds
+    feeds=$(echo "$response" | jq -c '.data.feeds // .data.sites // [] | .[]')
+    
+    if [ -z "$feeds" ] || [ "$feeds" = "[]" ]; then
+        print_info "No RSS feeds configured"
+        return
+    fi
+    
+    echo -e "${BOLD}RSS Feeds:${NC}"
+    echo ""
+    printf "%-6s %-25s %-35s %-20s %-10s\n" "ID" "Title" "URL" "Last Update" "Updating"
+    printf "%-6s %-25s %-35s %-20s %-10s\n" "──" "─────" "───" "──────────" "────────"
+    
+    echo "$feeds" | while read -r feed; do
+        local id title url last_update is_updating
+        id=$(echo "$feed" | jq -r '.id')
+        title=$(echo "$feed" | jq -r '.title' | cut -c1-23)
+        url=$(echo "$feed" | jq -r '.url' | cut -c1-33)
+        last_update=$(echo "$feed" | jq -r '.last_update // empty')
+        if [ -z "$last_update" ] || [ "$last_update" = "null" ]; then
+            last_update="-"
+        else
+            last_update=$(format_date "$last_update")
+        fi
+        is_updating=$(echo "$feed" | jq -r '.is_updating')
+        if [ "$is_updating" = "true" ]; then
+            is_updating="${YELLOW}Yes${NC}"
+        else
+            is_updating="-"
+        fi
+        printf "%-6s %-25s %-35s %-20s %-10b\n" "$id" "$title" "$url" "$last_update" "$is_updating"
+    done
+    
+    local feed_count
+    feed_count=$(echo "$feeds" | jq -s 'length')
+    echo ""
+    echo "Total: ${feed_count} feeds"
+}
+
+cmd_feeds_items() {
+    local feed_id="$1"
+    local limit="${2:-25}"
+    local offset="${3:-0}"
+    
+    ensure_auth
+    
+    local response
+    response=$(api_request "/webapi/DownloadStation/RSSfeed.cgi" "GET" "api=SYNO.DownloadStation.RSS.Feed&method=list&version=1&id=${feed_id}&offset=${offset}&limit=${limit}")
+    
+    local success
+    success=$(echo "$response" | jq -r '.success')
+    
+    if [ "$success" != "true" ]; then
+        print_error "Failed to list feed items"
+        exit 1
+    fi
+    
+    local items
+    items=$(echo "$response" | jq -c '.data.feeds // .data.items // [] | .[]')
+    
+    if [ -z "$items" ] || [ "$items" = "[]" ]; then
+        print_info "No items in this feed"
+        return
+    fi
+    
+    echo "$items" | while read -r item; do
+        local title size date is_new download_url
+        title=$(echo "$item" | jq -r '.title' | cut -c1-38)
+        size=$(echo "$item" | jq -r '.size // "-"')
+        date=$(echo "$item" | jq -r '.time // empty')
+        if [ -n "$date" ] && [ "$date" != "null" ]; then
+            date=$(format_date "$date")
+        else
+            date="-"
+        fi
+        is_new=$(echo "$item" | jq -r '.is_new // false')
+        if [ "$is_new" = "true" ]; then
+            is_new="${GREEN}●${NC}"
+        else
+            is_new="-"
+        fi
+        download_url=$(echo "$item" | jq -r '.download_uri // .link // .enclosure.url // empty' | cut -c1-38)
+        printf "%-4s %-40s %-12s %-18s %-5b %-40s\n" "" "$title" "$size" "$date" "$is_new" "$download_url"
+    done
+    
+    local total
+    total=$(echo "$response" | jq -r '.data.total // 0')
+    echo ""
+    echo "Showing ${limit} of ${total} items"
+}
+
+cmd_feeds_refresh() {
+    local feed_id="$1"
+    
+    ensure_auth
+    
+    local response
+    response=$(api_request "/webapi/DownloadStation/RSSsite.cgi" "POST" "api=SYNO.DownloadStation.RSS.Site&method=refresh&version=1&id=${feed_id}")
+    
+    local success
+    success=$(echo "$response" | jq -r '.success')
+    
+    if [ "$success" = "true" ]; then
+        print_success "Feed refresh started"
+    else
+        print_error "Failed to refresh feed"
+        exit 1
+    fi
+}
+
+cmd_feeds_download() {
+    local url="$1"
+    local destination="$2"
+    
+    ensure_auth
+    
+    local server
+    server=$(config_get_server)
+    local host port use_https sid
+    host=$(echo "$server" | jq -r '.server.config.host // .config.host')
+    port=$(echo "$server" | jq -r '.server.config.port // .config.port')
+    use_https=$(echo "$server" | jq -r '.server.config.useHTTPS // .config.useHTTPS')
+    sid=$(echo "$server" | jq -r '.server.config.sid // .config.sid')
+    
+    local base_url
+    base_url=$(build_base_url "$host" "$port" "$use_https")
+    
+    # URL encode parameters
+    local encoded_url=$(url_encode "$url")
+    local body="uri=${encoded_url}&_sid=${sid}"
+    if [ -n "$destination" ]; then
+        local encoded_dest=$(url_encode "$destination")
+        body="${body}&destination=${encoded_dest}"
+    fi
+    
+    local response
+    response=$(curl -s -S -k -X POST \
+        "${base_url}/webapi/entry.cgi" \
+        -d "$body" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "api=SYNO.DownloadStation.Task&method=create&version=3")
+    
+    local success
+    success=$(echo "$response" | jq -r '.success')
+    
+    if [ "$success" = "true" ]; then
+        print_success "Download task created"
+    else
+        print_error "Failed to create download task"
+        exit 1
+    fi
+}
+
+# Helper functions
+ensure_auth() {
+    local server
+    server=$(config_get_server)
+    if [ -z "$server" ]; then
+        print_error "Not logged in. Use 'dsget login' first."
+        exit 1
+    fi
+}
+
+get_all_task_ids() {
+    local response
+    response=$(api_request "/webapi/DownloadStation/task.cgi" "GET" "api=SYNO.DownloadStation.Task&method=list&version=1")
+    echo "$response" | jq -r '.data.tasks[].id' | tr '\n' ',' | sed 's/,$//'
+}
+
+format_size() {
+    local bytes=$1
+    if [ "$bytes" = "0" ] || [ -z "$bytes" ]; then
+        echo "0 B"
+        return
+    fi
+    
+    local units=("B" "KB" "MB" "GB" "TB")
+    local i=0
+    local size=$bytes
+    
+    while [ $(echo "$size >= 1024" | bc) -eq 1 ] && [ $i -lt 4 ]; do
+        size=$(echo "scale=1; $size / 1024" | bc)
+        i=$((i + 1))
+    done
+    
+    echo "${size} ${units[$i]}"
+}
+
+format_speed() {
+    local speed=$1
+    if [ "$speed" = "0" ] || [ -z "$speed" ]; then
+        echo "-"
+    else
+        echo "$(format_size "$speed")/s"
+    fi
+}
+
+format_date() {
+    local timestamp=$1
+    if [ -z "$timestamp" ] || [ "$timestamp" = "0" ]; then
+        echo "-"
+        return
+    fi
+    date -r "$timestamp" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "$timestamp"
+}
+
+format_status() {
+    local status=$1
+    local s=$(echo "$status" | tr '[:upper:]' '[:lower:]')
+    case $s in
+        downloading) printf "%s${NC}\n" "${GREEN}${status}" ;;
+        paused) printf "%s${NC}\n" "${YELLOW}${status}" ;;
+        finished) printf "%s${NC}\n" "${CYAN}${status}" ;;
+        seeding) printf "%s${NC}\n" "${BLUE}${status}" ;;
+        waiting) printf "%s${NC}\n" "${WHITE}${status}" ;;
+        error) printf "%s${NC}\n" "${RED}${status}" ;;
+        hash_checking) printf "%s${NC}\n" "${MAGENTA}${status}" ;;
+        extracting) printf "%s${NC}\n" "${MAGENTA}${status}" ;;
+        *) echo "$status" ;;
+    esac
+}
+
+print_tasks_table() {
+    local tasks="$1"
+    
+    printf "%-6s %-40s %-10s %-30s %-12s %-12s\n" "ID" "Title" "Size" "Progress" "Speed" "Status"
+    printf "%-6s %-40s %-10s %-30s %-12s %-12s\n" "──" "────" "────" "────────" "─────" "──────"
+    
+    echo "$tasks" | while read -r task; do
+        local id title size downloaded speed status
+        id=$(echo "$task" | jq -r '.id')
+        title=$(echo "$task" | jq -r '.title' | cut -c1-38)
+        size=$(echo "$task" | jq -r '.size')
+        downloaded=$(echo "$task" | jq -r '.additional.transfer.size_downloaded // 0')
+        speed=$(echo "$task" | jq -r '.additional.transfer.speed_download // 0')
+        status=$(echo "$task" | jq -r '.status')
+        
+        local size_formatted
+        size_formatted=$(format_size "$size")
+        local speed_formatted
+        speed_formatted=$(format_speed "$speed")
+        
+        # Progress bar
+        local progress=""
+        if [ "$size" != "0" ] && [ -n "$size" ]; then
+            local percent=$(echo "scale=1; $downloaded * 100 / $size" | bc)
+            local filled=$(echo "scale=0; $percent * 25 / 100" | bc)
+            local empty=$((25 - filled))
+            progress="["
+            for ((i=0; i<filled; i++)); do progress="${progress}█"; done
+            for ((i=0; i<empty; i++)); do progress="${progress}░"; done
+            progress="${progress}] $(printf '%5s' "${percent}%")"
+        else
+            progress="[────────────────────────]   0.0%"
+        fi
+        
+        local status_formatted
+        status_formatted=$(format_status "$status")
+        
+        printf "%-6s %-40s %-10s %-30s %-12s %-12b\n" "$id" "$title" "$size_formatted" "$progress" "$speed_formatted" "$status_formatted"
+    done
+}
+
+print_task_verbose() {
+    local task="$1"
+    
+    local title id type status size downloaded uploaded speed_download speed_upload destination create_time seeders leechers
+    title=$(echo "$task" | jq -r '.title')
+    id=$(echo "$task" | jq -r '.id')
+    type=$(echo "$task" | jq -r '.type')
+    status=$(echo "$task" | jq -r '.status')
+    size=$(echo "$task" | jq -r '.size')
+    downloaded=$(echo "$task" | jq -r '.additional.transfer.size_downloaded // 0')
+    uploaded=$(echo "$task" | jq -r '.additional.transfer.size_uploaded // 0')
+    speed_download=$(echo "$task" | jq -r '.additional.transfer.speed_download // 0')
+    speed_upload=$(echo "$task" | jq -r '.additional.transfer.speed_upload // 0')
+    destination=$(echo "$task" | jq -r '.additional.detail.destination // empty')
+    create_time=$(echo "$task" | jq -r '.additional.detail.create_time // empty')
+    seeders=$(echo "$task" | jq -r '.additional.detail.connected_seeders // empty')
+    leechers=$(echo "$task" | jq -r '.additional.detail.connected_leechers // empty')
+    
+    echo "──────────────────────────────────────────────────────────────"
+    echo -e "${BOLD}Title:${NC} $title"
+    echo -e "${BOLD}ID:${NC} $id"
+    echo -e "${BOLD}Type:${NC} $(echo "$type" | tr '[:lower:]' '[:upper:]')"
+    echo -e "${BOLD}Status:${NC} $(format_status "$status")"
+    echo -e "${BOLD}Size:${NC} $(format_size "$size")"
+    echo -e "${BOLD}Downloaded:${NC} $(format_size "$downloaded")"
+    echo -e "${BOLD}Uploaded:${NC} $(format_size "$uploaded")"
+    echo -e "${BOLD}Download Speed:${NC} $(format_speed "$speed_download")"
+    echo -e "${BOLD}Upload Speed:${NC} $(format_speed "$speed_upload")"
+    
+    if [ -n "$destination" ]; then
+        echo -e "${BOLD}Destination:${NC} $destination"
+    fi
+    
+    if [ -n "$create_time" ] && [ "$create_time" != "null" ]; then
+        echo -e "${BOLD}Created:${NC} $(format_date "$create_time")"
+    fi
+    
+    if [ -n "$seeders" ] && [ "$seeders" != "null" ]; then
+        echo -e "${BOLD}Seeders:${NC} $seeders"
+    fi
+    
+    if [ -n "$leechers" ] && [ "$leechers" != "null" ]; then
+        echo -e "${BOLD}Leechers:${NC} $leechers"
+    fi
+    
+    # Files
+    local files
+    files=$(echo "$task" | jq -c '.additional.file // [] | .[]')
+    if [ -n "$files" ] && [ "$files" != "[]" ]; then
+        local file_count
+        file_count=$(echo "$files" | jq -s 'length')
+        echo ""
+        echo -e "${BOLD}Files (${file_count}):${NC}"
+        local displayed=0
+        echo "$files" | while read -r file; do
+            if [ $displayed -ge 10 ]; then
+                local remaining=$((file_count - 10))
+                echo "  ... and ${remaining} more files"
+                break
+            fi
+            local filename size size_downloaded
+            filename=$(echo "$file" | jq -r '.filename')
+            size=$(echo "$file" | jq -r '.size')
+            size_downloaded=$(echo "$file" | jq -r '.size_downloaded // 0')
+            local file_percent="0.0"
+            if [ "$size" != "0" ] && [ -n "$size" ]; then
+                file_percent=$(echo "scale=1; $size_downloaded * 100 / $size" | bc)
+            fi
+            echo "  $filename [$(format_size "$size")] ${file_percent}%"
+            displayed=$((displayed + 1))
+        done
+    fi
+}
+
+print_files_short() {
+    local files="$1"
+    
+    echo "$files" | while read -r file; do
+        local name isdir
+        name=$(echo "$file" | jq -r '.name')
+        isdir=$(echo "$file" | jq -r '.isdir')
+        if [ "$isdir" = "true" ]; then
+            printf "%s${NC}\n" "${BLUE}${name}/"
+        else
+            echo "$name"
+        fi
+    done
+}
+
+print_files_long() {
+    local files="$1"
+    
+    printf "%-35s %-12s %-22s %-10s\n" "Name" "Size" "Modified" "Type"
+    printf "%-35s %-12s %-22s %-10s\n" "────" "────" "────────" "────"
+    
+    echo "$files" | while read -r file; do
+        local name size mtime isdir type
+        name=$(echo "$file" | jq -r '.name' | cut -c1-33)
+        size=$(echo "$file" | jq -r '.additional.size // 0')
+        mtime=$(echo "$file" | jq -r '.additional.time.mtime // 0')
+        isdir=$(echo "$file" | jq -r '.isdir')
+        
+        if [ "$isdir" = "true" ]; then
+            type="DIR"
+            printf "%s${NC} " "${BLUE}$(printf '%-35s' "$name")" "$(printf '%-12s' "-")" "$(printf '%-22s' "$(format_date "$mtime")")" "$(printf '%-10s' "$type")"
+            echo
+        else
+            type="FILE"
+            printf "%s " "$(printf '%-35s' "$name")" "$(printf '%-12s' "$(format_size "$size")")" "$(printf '%-22s' "$(format_date "$mtime")")" "$(printf '%-10s' "$type")"
+            echo
+        fi
+    done
+}
+
+print_shares_list() {
+    local shares="$1"
+    local long="$2"
+    
+    if [ "$long" = "true" ]; then
+        printf "%-30s %-45s\n" "Name" "Path"
+        printf "%-30s %-45s\n" "────" "────"
+        echo "$shares" | while read -r share; do
+            local name path
+            name=$(echo "$share" | jq -r '.name')
+            path=$(echo "$share" | jq -r '.path')
+            printf "%s${NC} " "${BLUE}$(printf '%-30s' "$name")" "$(printf '%-45s' "$path")"
+            echo
+        done
+    else
+        echo "$shares" | while read -r share; do
+            local name
+            name=$(echo "$share" | jq -r '.name')
+            printf "  %s${NC}\n" "${BLUE}${name}/"
+        done
+    fi
+}
+
+# Main command dispatcher
+show_help() {
+    echo "dsget - Synology NAS CLI"
+    echo ""
+    echo "Usage: dsget <command> [options]"
+    echo ""
+    echo "Commands:"
+    echo "  login [--url <url> | -h <host> -p <port>] -u <username> [-P <password>] [-s]"
+    echo "  logout"
+    echo "  tasks [list|ls] [-v] [-s <status>]"
+    echo "  tasks add <uri|file> [-d <destination>]"
+    echo "  tasks pause <id>|all"
+    echo "  tasks resume <id>|all"
+    echo "  tasks delete <id> [-f]"
+    echo "  tasks info <id>"
+    echo "  files [ls] [path] [-l] [-a]"
+    echo "  files shares"
+    echo "  files mkdir <path> <name>"
+    echo "  files info <path>"
+    echo "  feeds [list|ls]"
+    echo "  feeds items <feedId> [-l <limit>]"
+    echo "  feeds refresh <feedId>"
+    echo "  feeds download <url> [-d <destination>]"
+    echo ""
+    echo "Options:"
+    echo "  -h, --host <host>     Server hostname or IP"
+    echo "  -p, --port <port>     Server port (default: 5001 for HTTPS, 5000 for HTTP)"
+    echo "  --url <url>           Server URL (e.g., https://nas.example.com:5001)"
+    echo "  -u, --username <user> Username"
+    echo "  -P, --password <pwd>  Password (will prompt if not provided)"
+    echo "  -s, --secure          Use HTTPS"
+    echo "  -v, --verbose         Verbose output"
+    echo "  -s, --status <status> Filter by status"
+    echo "  -d, --destination <path>  Destination folder"
+    echo "  -l, --long            Long format"
+    echo "  -a, --all             Show hidden files"
+    echo "  -f, --force           Skip confirmation"
+    echo ""
+}
+
+# Parse arguments and dispatch
+main() {
+    if [ $# -eq 0 ]; then
+        show_help
+        exit 0
+    fi
+    
+    local cmd="$1"
+    shift
+    
+    case "$cmd" in
+        -h|--help|help)
+            show_help
+            exit 0
+            ;;
+        login)
+            local host="" port="" url="" username="" password="" secure="false"
+            
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    -h|--host) host="$2"; shift 2 ;;
+                    -p|--port) port="$2"; shift 2 ;;
+                    --url) url="$2"; shift 2 ;;
+                    -u|--username) username="$2"; shift 2 ;;
+                    -P|--password) password="$2"; shift 2 ;;
+                    -s|--secure) secure="true"; shift ;;
+                    *) shift ;;
+                esac
+            done
+            
+            if [ -z "$username" ]; then
+                print_error "Username is required (-u)"
+                exit 1
+            fi
+            
+            if [ -n "$url" ]; then
+                # Parse URL
+                local proto="http"
+                if [[ "$url" =~ ^https:// ]]; then
+                    proto="https"
+                    url="${url#https://}"
+                elif [[ "$url" =~ ^http:// ]]; then
+                    url="${url#http://}"
+                fi
+                
+                host="${url%%:*}"
+                # Only extract port if URL contains a colon after the host
+                if [[ "$url" == *:* ]]; then
+                    local port_part="${url#*:}"
+                    port="${port_part%%/*}"
+                fi
+                
+                if [ "$proto" = "https" ]; then
+                    secure="true"
+                fi
+            fi
+            
+            if [ -z "$host" ]; then
+                print_error "Host or URL is required"
+                exit 1
+            fi
+            
+            if [ -z "$port" ]; then
+                if [ "$secure" = "true" ]; then
+                    port="5001"
+                else
+                    port="5000"
+                fi
+            fi
+            
+            if [ -z "$password" ]; then
+                read -s -p "Password: " password
+                echo
+            fi
+            
+            api_login "$host" "$port" "$secure" "$username" "$password"
+            ;;
+        logout)
+            api_logout
+            ;;
+        tasks)
+            if [ $# -eq 0 ]; then
+                cmd_tasks_list "false" ""
+            else
+                local subcmd="$1"
+                shift
+                case "$subcmd" in
+                    list|ls)
+                        local verbose="false" status=""
+                        while [ $# -gt 0 ]; do
+                            case "$1" in
+                                -v|--verbose) verbose="true"; shift ;;
+                                -s|--status) status="$2"; shift 2 ;;
+                                *) shift ;;
+                            esac
+                        done
+                        cmd_tasks_list "$verbose" "$status"
+                        ;;
+                    add)
+                        local uri="$1" destination=""
+                        shift
+                        while [ $# -gt 0 ]; do
+                            case "$1" in
+                                -d|--destination) destination="$2"; shift 2 ;;
+                                *) shift ;;
+                            esac
+                        done
+                        if [ -z "$uri" ]; then
+                            print_error "URI or file path required"
+                            exit 1
+                        fi
+                        cmd_tasks_add "$uri" "$destination"
+                        ;;
+                    pause)
+                        local ids="$1"
+                        shift
+                        if [ -z "$ids" ]; then
+                            print_error "Task ID(s) required"
+                            exit 1
+                        fi
+                        cmd_tasks_pause "$ids"
+                        ;;
+                    resume)
+                        local ids="$1"
+                        shift
+                        if [ -z "$ids" ]; then
+                            print_error "Task ID(s) required"
+                            exit 1
+                        fi
+                        cmd_tasks_resume "$ids"
+                        ;;
+                    delete|rm)
+                        local ids="$1" force="false"
+                        shift
+                        while [ $# -gt 0 ]; do
+                            case "$1" in
+                                -f|--force) force="true"; shift ;;
+                                *) shift ;;
+                            esac
+                        done
+                        if [ -z "$ids" ]; then
+                            print_error "Task ID(s) required"
+                            exit 1
+                        fi
+                        cmd_tasks_delete "$ids" "$force"
+                        ;;
+                    info)
+                        local id="$1"
+                        shift
+                        if [ -z "$id" ]; then
+                            print_error "Task ID required"
+                            exit 1
+                        fi
+                        cmd_tasks_info "$id"
+                        ;;
+                    *)
+                        print_error "Unknown tasks subcommand: $subcmd"
+                        exit 1
+                        ;;
+                esac
+            fi
+            ;;
+        files)
+            if [ $# -eq 0 ]; then
+                cmd_files_shares "false"
+            else
+                local subcmd="$1"
+                shift
+                case "$subcmd" in
+                    ls)
+                        local path="" long="false" all="false"
+                        if [ $# -gt 0 ] && [[ "$1" != -* ]]; then
+                            path="$1"
+                            shift
+                        fi
+                        while [ $# -gt 0 ]; do
+                            case "$1" in
+                                -l|--long) long="true"; shift ;;
+                                -a|--all) all="true"; shift ;;
+                                *) shift ;;
+                            esac
+                        done
+                        cmd_files_ls "$path" "$long" "$all"
+                        ;;
+                    shares)
+                        local long="false"
+                        while [ $# -gt 0 ]; do
+                            case "$1" in
+                                -l|--long) long="true"; shift ;;
+                                *) shift ;;
+                            esac
+                        done
+                        cmd_files_shares "$long"
+                        ;;
+                    mkdir)
+                        local path="$1" name="$2"
+                        shift 2
+                        if [ -z "$path" ] || [ -z "$name" ]; then
+                            print_error "Path and name required"
+                            exit 1
+                        fi
+                        cmd_files_mkdir "$path" "$name"
+                        ;;
+                    info)
+                        local path="$1"
+                        shift
+                        if [ -z "$path" ]; then
+                            print_error "Path required"
+                            exit 1
+                        fi
+                        cmd_files_info "$path"
+                        ;;
+                    *)
+                        # Assume it's a path for ls
+                        cmd_files_ls "$subcmd" "false" "false"
+                        ;;
+                esac
+            fi
+            ;;
+        feeds)
+            if [ $# -eq 0 ]; then
+                cmd_feeds_list
+            else
+                local subcmd="$1"
+                shift
+                case "$subcmd" in
+                    list|ls)
+                        cmd_feeds_list
+                        ;;
+                    items)
+                        local feed_id="$1" limit="25" offset="0"
+                        shift
+                        while [ $# -gt 0 ]; do
+                            case "$1" in
+                                -l|--limit) limit="$2"; shift 2 ;;
+                                -o|--offset) offset="$2"; shift 2 ;;
+                                *) shift ;;
+                            esac
+                        done
+                        if [ -z "$feed_id" ]; then
+                            print_error "Feed ID required"
+                            exit 1
+                        fi
+                        cmd_feeds_items "$feed_id" "$limit" "$offset"
+                        ;;
+                    refresh)
+                        local feed_id="$1"
+                        shift
+                        if [ -z "$feed_id" ]; then
+                            print_error "Feed ID required"
+                            exit 1
+                        fi
+                        cmd_feeds_refresh "$feed_id"
+                        ;;
+                    download)
+                        local url="$1" destination=""
+                        shift
+                        while [ $# -gt 0 ]; do
+                            case "$1" in
+                                -d|--destination) destination="$2"; shift 2 ;;
+                                *) shift ;;
+                            esac
+                        done
+                        if [ -z "$url" ]; then
+                            print_error "URL required"
+                            exit 1
+                        fi
+                        cmd_feeds_download "$url" "$destination"
+                        ;;
+                    *)
+                        print_error "Unknown feeds subcommand: $subcmd"
+                        exit 1
+                        ;;
+                esac
+            fi
+            ;;
+        *)
+            print_error "Unknown command: $cmd"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

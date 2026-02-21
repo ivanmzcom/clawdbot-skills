@@ -1,0 +1,515 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Colors (disabled if not a terminal)
+if [ -t 1 ]; then
+    RED=$'\033[0;31m'
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[0;33m'
+    BLUE=$'\033[0;34m'
+    CYAN=$'\033[0;36m'
+    GRAY=$'\033[0;90m'
+    BOLD=$'\033[1m'
+    NC=$'\033[0m'
+else
+    RED='' GREEN='' YELLOW='' BLUE='' CYAN='' GRAY='' BOLD='' NC=''
+fi
+
+source "${SCRIPT_DIR}/config.sh"
+
+# Print functions
+print_error() { printf "${RED}Error:${NC} %s\n" "$1" >&2; }
+print_success() { printf "${GREEN}✓${NC} %s\n" "$1"; }
+print_info() { printf "${BLUE}ℹ${NC} %s\n" "$1"; }
+
+# Constants
+BASE_URL="https://api.steampowered.com"
+STORE_URL="https://store.steampowered.com/api"
+
+# Format helpers
+format_playtime() {
+    local minutes="${1:-0}"
+    if [ "$minutes" = "0" ] || [ "$minutes" = "null" ] || [ -z "$minutes" ]; then
+        echo "0.0h"
+        return
+    fi
+    echo "scale=1; $minutes / 60" | bc | sed 's/^\./0./'
+    printf "h"
+}
+
+format_playtime_inline() {
+    local minutes="${1:-0}"
+    if [ "$minutes" = "0" ] || [ "$minutes" = "null" ] || [ -z "$minutes" ]; then
+        echo "0.0h"
+        return
+    fi
+    local hours
+    hours=$(echo "scale=1; $minutes / 60" | bc | sed 's/^\./0./')
+    echo "${hours}h"
+}
+
+pad_string() {
+    local str="$1" len="$2"
+    printf "%-${len}s" "${str:0:$len}"
+}
+
+# API functions
+api_steam() {
+    local endpoint="$1"
+    local apikey
+    apikey=$(config_get_apikey)
+    curl -s "${BASE_URL}${endpoint}&key=${apikey}"
+}
+
+api_store() {
+    local endpoint="$1"
+    curl -s "${STORE_URL}${endpoint}"
+}
+
+# Command functions
+cmd_config() {
+    echo "${BOLD}Steam CLI Configuration${NC}"
+    echo ""
+
+    local config apikey steamid
+    apikey=$(config_get_apikey 2>/dev/null || true)
+    steamid=$(config_get_steamid 2>/dev/null || true)
+
+    echo "Leave empty to keep current value."
+    echo ""
+
+    local new_apikey new_steamid
+    read -p "Steam API Key${apikey:+ [****]}: " new_apikey
+    read -p "Steam ID${steamid:+ [${steamid}]}: " new_steamid
+
+    new_apikey="${new_apikey:-$apikey}"
+    new_steamid="${new_steamid:-$steamid}"
+
+    if [ -z "$new_apikey" ] || [ -z "$new_steamid" ]; then
+        print_error "API key and Steam ID are required."
+        exit 1
+    fi
+
+    config_save "$new_apikey" "$new_steamid"
+    print_success "Configuration saved."
+}
+
+cmd_profile() {
+    config_require
+
+    local apikey steamid
+    apikey=$(config_get_apikey)
+    steamid=$(config_get_steamid)
+
+    local response
+    response=$(api_steam "/ISteamUser/GetPlayerSummaries/v0002/?steamids=${steamid}")
+
+    local player
+    player=$(echo "$response" | jq '.response.players[0]')
+
+    if [ "$player" = "null" ]; then
+        print_error "Player not found."
+        exit 1
+    fi
+
+    local name sid country profile_url timecreated lastlogoff
+    name=$(echo "$player" | jq -r '.personaname')
+    sid=$(echo "$player" | jq -r '.steamid')
+    country=$(echo "$player" | jq -r '.loccountrycode // "Unknown"')
+    profile_url=$(echo "$player" | jq -r '.profileurl')
+    timecreated=$(echo "$player" | jq -r '.timecreated // empty')
+    lastlogoff=$(echo "$player" | jq -r '.lastlogoff // empty')
+
+    echo ""
+    echo "${BOLD}Steam Profile${NC}"
+    echo "$(printf '═%.0s' {1..42})"
+    echo "Name:     ${name}"
+    echo "ID:       ${sid}"
+    echo "Country:  ${country}"
+    echo "Profile:  ${profile_url}"
+    if [ -n "$timecreated" ] && [ "$timecreated" != "null" ]; then
+        echo "Joined:   $(date -r "$timecreated" "+%Y-%m-%d" 2>/dev/null || echo "$timecreated")"
+    fi
+    if [ -n "$lastlogoff" ] && [ "$lastlogoff" != "null" ]; then
+        echo "Last on:  $(date -r "$lastlogoff" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$lastlogoff")"
+    fi
+}
+
+cmd_games() {
+    local page=1 limit=50
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -p|--page) page="$2"; shift 2 ;;
+            -l|--limit) limit="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    config_require
+
+    local apikey steamid
+    apikey=$(config_get_apikey)
+    steamid=$(config_get_steamid)
+
+    local response
+    response=$(api_steam "/IPlayerService/GetOwnedGames/v0001/?steamid=${steamid}&include_appinfo=1&include_played_free_games=1&format=json")
+
+    local total_games
+    total_games=$(echo "$response" | jq '.response.game_count')
+
+    local total_pages=$(( (total_games + limit - 1) / limit ))
+    local start=$(( (page - 1) * limit ))
+
+    echo ""
+    echo "${BOLD}Your Library (${total_games} games)${NC}"
+    echo "$(printf '═%.0s' {1..42})"
+
+    echo "$response" | jq -r --argjson start "$start" --argjson limit "$limit" \
+        '[.response.games[] | {name, playtime: .playtime_forever}] | sort_by(-.playtime) | .[$start:$start+$limit] | to_entries[] | "\(.key + $start + 1). \(.value.name)\n   Playtime: \(if .value.playtime == 0 then "0.0h" else ((.value.playtime / 60 * 10 | floor) / 10 | tostring) + "h" end)"'
+
+    echo ""
+    echo "Page ${page}/${total_pages} | Total: ${total_games} games"
+}
+
+cmd_top() {
+    local count="${1:-10}"
+
+    config_require
+
+    local apikey steamid
+    apikey=$(config_get_apikey)
+    steamid=$(config_get_steamid)
+
+    local response
+    response=$(api_steam "/IPlayerService/GetOwnedGames/v0001/?steamid=${steamid}&include_appinfo=1&include_played_free_games=1&format=json")
+
+    echo ""
+    echo "${BOLD}Top ${count} Games by Playtime${NC}"
+    echo "$(printf '═%.0s' {1..52})"
+
+    local max_minutes
+    max_minutes=$(echo "$response" | jq '[.response.games[].playtime_forever] | max')
+
+    echo "$response" | jq -r --argjson count "$count" --argjson max "$max_minutes" \
+        '[.response.games[] | {name, playtime: .playtime_forever}] | sort_by(-.playtime) | .[0:$count] | to_entries[] |
+        (.key + 1 | tostring | if length < 2 then " " + . else . end) as $rank |
+        (.value.playtime / 60 * 10 | floor) / 10 as $hours |
+        (if $max == 0 then 0 else (.value.playtime / $max * 20 | floor) end) as $filled |
+        (20 - $filled) as $empty |
+        "\($rank). \(.value.name)\n    \("█" * $filled)\("░" * $empty) \($hours)h"'
+}
+
+cmd_shame() {
+    config_require
+
+    local apikey steamid
+    apikey=$(config_get_apikey)
+    steamid=$(config_get_steamid)
+
+    local response
+    response=$(api_steam "/IPlayerService/GetOwnedGames/v0001/?steamid=${steamid}&include_appinfo=1&include_played_free_games=1&format=json")
+
+    local total unplayed played percent
+    total=$(echo "$response" | jq '.response.game_count')
+    unplayed=$(echo "$response" | jq '[.response.games[] | select(.playtime_forever == 0)] | length')
+    played=$((total - unplayed))
+    percent=$(echo "scale=1; $unplayed * 100 / $total" | bc)
+
+    echo ""
+    echo "${BOLD}Wall of Shame${NC}"
+    echo "$(printf '═%.0s' {1..42})"
+    echo "Unplayed: ${unplayed}/${total} (${percent}%)"
+    echo "Played:   ${played}/${total}"
+    echo ""
+
+    echo "$response" | jq -r '[.response.games[] | select(.playtime_forever == 0)] | sort_by(.name | ascii_downcase)[] | .name' | while read -r name; do
+        echo "  ${GRAY}▪${NC} ${name}"
+    done
+}
+
+cmd_recent() {
+    config_require
+
+    local apikey steamid
+    apikey=$(config_get_apikey)
+    steamid=$(config_get_steamid)
+
+    local response
+    response=$(api_steam "/IPlayerService/GetRecentlyPlayedGames/v0001/?steamid=${steamid}")
+
+    echo ""
+    echo "${BOLD}Recently Played${NC}"
+    echo "$(printf '═%.0s' {1..42})"
+
+    local count
+    count=$(echo "$response" | jq '.response.total_count // 0')
+
+    if [ "$count" = "0" ]; then
+        echo "No recently played games."
+        return
+    fi
+
+    echo "$response" | jq -r '.response.games[] |
+        "• \(.name)\n  Last 2 weeks: \(if .playtime_2weeks == 0 then "0.0h" else ((.playtime_2weeks / 60 * 10 | floor) / 10 | tostring) + "h" end)"'
+}
+
+cmd_stats() {
+    config_require
+
+    local apikey steamid
+    apikey=$(config_get_apikey)
+    steamid=$(config_get_steamid)
+
+    local games_response recent_response
+    games_response=$(api_steam "/IPlayerService/GetOwnedGames/v0001/?steamid=${steamid}&include_appinfo=1&include_played_free_games=1&format=json")
+    recent_response=$(api_steam "/IPlayerService/GetRecentlyPlayedGames/v0001/?steamid=${steamid}")
+
+    local total games_played total_playtime top_game top_playtime recent_total
+    total=$(echo "$games_response" | jq '.response.game_count')
+    games_played=$(echo "$games_response" | jq '[.response.games[] | select(.playtime_forever > 0)] | length')
+    total_playtime=$(echo "$games_response" | jq '[.response.games[].playtime_forever] | add // 0')
+    top_game=$(echo "$games_response" | jq -r '[.response.games[]] | sort_by(-.playtime_forever) | .[0].name // "None"')
+    top_playtime=$(echo "$games_response" | jq '[.response.games[]] | sort_by(-.playtime_forever) | .[0].playtime_forever // 0')
+    recent_total=$(echo "$recent_response" | jq '[.response.games[]?.playtime_2weeks // 0] | add // 0')
+
+    local total_hours top_hours recent_hours
+    total_hours=$(echo "scale=1; $total_playtime / 60" | bc | sed 's/^\./0./')
+    top_hours=$(echo "scale=1; $top_playtime / 60" | bc | sed 's/^\./0./')
+    recent_hours=$(echo "scale=1; $recent_total / 60" | bc | sed 's/^\./0./')
+
+    echo ""
+    echo "${BOLD}Statistics${NC}"
+    echo "$(printf '═%.0s' {1..42})"
+    echo "Total games:      ${total}"
+    echo "Games played:     ${games_played}"
+    echo "Total playtime:   ${total_hours}h"
+    echo "Top game:         ${top_game} (${top_hours}h)"
+    echo ""
+    echo "Last 2 weeks:"
+    echo "Playtime:         ${recent_hours}h"
+}
+
+cmd_achievements() {
+    local app_id="${1:-}"
+
+    if [ -z "$app_id" ]; then
+        echo "Usage: steam achievements <app_id>"
+        echo "Example: steam achievements 730  (CS:GO)"
+        exit 1
+    fi
+
+    config_require
+
+    local apikey steamid
+    apikey=$(config_get_apikey)
+    steamid=$(config_get_steamid)
+
+    local response
+    response=$(api_steam "/ISteamUserStats/GetPlayerAchievements/v0001/?appid=${app_id}&steamid=${steamid}")
+
+    local success
+    success=$(echo "$response" | jq -r '.playerstats.success // false')
+
+    if [ "$success" != "true" ]; then
+        print_error "Could not get achievements. Game may not have achievements or profile may be private."
+        exit 1
+    fi
+
+    local game_name total earned percent
+    game_name=$(echo "$response" | jq -r '.playerstats.gameName // "Unknown"')
+    total=$(echo "$response" | jq '[.playerstats.achievements[]] | length')
+    earned=$(echo "$response" | jq '[.playerstats.achievements[] | select(.achieved == 1)] | length')
+    percent=$(echo "scale=1; $earned * 100 / $total" | bc)
+
+    echo ""
+    echo "${BOLD}Achievements - ${game_name}${NC}"
+    echo "$(printf '═%.0s' {1..42})"
+    echo "Earned: ${earned}/${total} (${percent}%)"
+    echo ""
+
+    echo "$response" | jq -r '.playerstats.achievements[:20][] |
+        (if .achieved == 1 then "✅" else "⬜" end) + " " + (.name // .apiname // "Unknown")' 2>/dev/null || \
+    echo "$response" | jq -r '.playerstats.achievements[:20][] |
+        (if .achieved == 1 then "[x]" else "[ ]" end) + " " + (.apiname // "Unknown")'
+
+    if [ "$total" -gt 20 ]; then
+        echo ""
+        echo "... and $((total - 20)) more"
+    fi
+}
+
+cmd_wishlist() {
+    config_require
+
+    local steamid
+    steamid=$(config_get_steamid)
+
+    local response
+    response=$(curl -s "${BASE_URL}/IWishlistService/GetWishlist/v1/?steamid=${steamid}")
+
+    local items
+    items=$(echo "$response" | jq '.response.items // []')
+    local count
+    count=$(echo "$items" | jq 'length')
+
+    echo ""
+    echo "${BOLD}Wishlist (${count} games)${NC}"
+    echo "$(printf '═%.0s' {1..42})"
+
+    if [ "$count" = "0" ]; then
+        echo "Your wishlist is empty."
+        return
+    fi
+
+    echo "$items" | jq -r '.[] | "\(.appid)\t\(.date_added)"' | while IFS=$'\t' read -r appid date_added; do
+        local name="Unknown (${appid})"
+        local details
+        details=$(curl -s "${STORE_URL}/appdetails?appids=${appid}" 2>/dev/null)
+        local store_name
+        store_name=$(echo "$details" | jq -r ".\"${appid}\".data.name // empty" 2>/dev/null)
+        if [ -n "$store_name" ]; then
+            name="$store_name"
+        fi
+        local date_str
+        date_str=$(date -r "$date_added" "+%Y-%m-%d" 2>/dev/null || echo "$date_added")
+        echo "• ${name}"
+        echo "  ${GRAY}Added: ${date_str}${NC}"
+    done
+}
+
+cmd_search() {
+    local query="${1:-}"
+
+    if [ -z "$query" ]; then
+        print_error "Search query required."
+        exit 1
+    fi
+
+    config_require
+
+    local apikey steamid
+    apikey=$(config_get_apikey)
+    steamid=$(config_get_steamid)
+
+    local response
+    response=$(api_steam "/IPlayerService/GetOwnedGames/v0001/?steamid=${steamid}&include_appinfo=1&include_played_free_games=1&format=json")
+
+    local query_lower
+    query_lower=$(echo "$query" | tr '[:upper:]' '[:lower:]')
+
+    local results
+    results=$(echo "$response" | jq -r --arg q "$query_lower" \
+        '[.response.games[] | select(.name | ascii_downcase | contains($q))]')
+
+    local count
+    count=$(echo "$results" | jq 'length')
+
+    echo ""
+    echo "${BOLD}Search results for '${query}' (${count} matches)${NC}"
+    echo "$(printf '═%.0s' {1..42})"
+
+    if [ "$count" = "0" ]; then
+        echo "No matches found."
+        return
+    fi
+
+    echo "$results" | jq -r '.[] |
+        "• \(.name)\n  App ID: \(.appid) | Playtime: \(if .playtime_forever == 0 then "0.0h" else ((.playtime_forever / 60 * 10 | floor) / 10 | tostring) + "h" end)"'
+}
+
+cmd_summary() {
+    config_require
+
+    local apikey steamid
+    apikey=$(config_get_apikey)
+    steamid=$(config_get_steamid)
+
+    local profile_response games_response recent_response
+    profile_response=$(api_steam "/ISteamUser/GetPlayerSummaries/v0002/?steamids=${steamid}")
+    games_response=$(api_steam "/IPlayerService/GetOwnedGames/v0001/?steamid=${steamid}&include_appinfo=1&include_played_free_games=1&format=json")
+    recent_response=$(api_steam "/IPlayerService/GetRecentlyPlayedGames/v0001/?steamid=${steamid}")
+
+    local name total games_played total_playtime total_hours
+    name=$(echo "$profile_response" | jq -r '.response.players[0].personaname')
+    total=$(echo "$games_response" | jq '.response.game_count')
+    games_played=$(echo "$games_response" | jq '[.response.games[] | select(.playtime_forever > 0)] | length')
+    total_playtime=$(echo "$games_response" | jq '[.response.games[].playtime_forever] | add // 0')
+    total_hours=$(echo "scale=1; $total_playtime / 60" | bc | sed 's/^\./0./')
+
+    echo ""
+    echo "╔═══════════════════════════════════════╗"
+    echo "║          Steam Summary                ║"
+    echo "╠═══════════════════════════════════════╣"
+    printf "║ User:   %-28s║\n" "$name"
+    printf "║ Games:  %-28s║\n" "${total} (${games_played} played)"
+    printf "║ Time:   %-28s║\n" "${total_hours}h"
+    echo "╚═══════════════════════════════════════╝"
+
+    local recent_count
+    recent_count=$(echo "$recent_response" | jq '.response.total_count // 0')
+
+    if [ "$recent_count" -gt 0 ] 2>/dev/null; then
+        echo ""
+        echo "Recently Played:"
+        echo "$recent_response" | jq -r '.response.games[:5][] |
+            "  • \(.name) (\(if .playtime_2weeks == 0 then "0.0h" else ((.playtime_2weeks / 60 * 10 | floor) / 10 | tostring) + "h" end))"'
+    fi
+
+    echo ""
+    echo "Run 'steam help' for commands"
+}
+
+# Help
+show_help() {
+    echo "steam - Steam CLI"
+    echo ""
+    echo "Usage: steam <command> [options]"
+    echo ""
+    echo "Commands:"
+    echo "  config                     Configure API key and Steam ID"
+    echo "  profile                    Show your Steam profile"
+    echo "  games [-p page] [-l limit] Show your game library"
+    echo "  top [count]                Top games by playtime"
+    echo "  shame                      Unplayed games (wall of shame)"
+    echo "  recent                     Recently played games"
+    echo "  stats                      Play statistics"
+    echo "  achievements <app_id>      Achievements for a game"
+    echo "  wishlist                   Your wishlist"
+    echo "  search <query>             Search your library"
+    echo ""
+}
+
+# Main dispatcher
+main() {
+    if [ $# -eq 0 ]; then
+        cmd_summary
+        exit 0
+    fi
+
+    local cmd="$1"
+    shift
+
+    case "$cmd" in
+        -h|--help|help)     show_help ;;
+        config|configure)   cmd_config "$@" ;;
+        profile|me)         cmd_profile "$@" ;;
+        games|library)      cmd_games "$@" ;;
+        top)                cmd_top "$@" ;;
+        shame)              cmd_shame "$@" ;;
+        recent|last-played) cmd_recent "$@" ;;
+        stats|statistics)   cmd_stats "$@" ;;
+        achievements)       cmd_achievements "$@" ;;
+        wishlist)           cmd_wishlist "$@" ;;
+        search)             cmd_search "$@" ;;
+        *)
+            print_error "Unknown command: $cmd"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
