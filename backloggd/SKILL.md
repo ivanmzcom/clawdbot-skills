@@ -178,6 +178,22 @@ curl -s -X PATCH "https://backloggd.com/log/status/" \
   --data "game_id=$GAME_ID&status_id=$STATUS_ID"
 ```
 
+IDs de estado detectados en `#quick-play-type-modal`:
+
+- `0` → **Completed** — Beat your main objective
+- `2` → **Abandoned** — Unfinished and staying that way
+- `3` → **Retired** — Finished with a game that lacks an ending
+- `4` → **Shelved** — Unfinished but may pick up again later
+- `5` → **Played** — Nothing specific
+
+Ejemplo rápido (marcar como Completed):
+
+```bash
+curl -s -X PATCH "https://backloggd.com/log/status/" \
+  "${AUTH_HEADERS[@]}" \
+  --data "game_id=25076&status_id=0"
+```
+
 ### E) Puntuar juego
 
 ```bash
