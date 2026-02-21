@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_URL="https://backloggd.com"
-SERVICE="backloggd"
+BASE_URL="${BACKLOGGD_MINI_BASE_URL:-https://backloggd.com}"
+SERVICE="${BACKLOGGD_MINI_SERVICE:-backloggd}"
+DRY_RUN="${BACKLOGGD_MINI_DRY_RUN:-0}"
 
 need_bin() { command -v "$1" >/dev/null 2>&1 || { echo "Falta binario: $1" >&2; exit 1; }; }
-need_bin curl
-need_bin security
-need_bin python3
+need_bin curl; need_bin security; need_bin python3
 
-kc() {
-  local account="$1"
-  security find-generic-password -s "$SERVICE" -a "$account" -w 2>/dev/null || true
-}
+kc() { security find-generic-password -s "$SERVICE" -a "$1" -w 2>/dev/null || true; }
+urlencode() { python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$1"; }
 
 USERNAME="$(kc username)"
 CSRF="$(kc csrf_token)"
@@ -27,8 +24,9 @@ auth_headers=(
 )
 
 require_auth() {
+  [[ "$DRY_RUN" == "1" ]] && return 0
   if [[ -z "${CSRF}" || -z "${COOKIE}" ]]; then
-    echo "Faltan csrf_token/cookie_header en keychain (servicio backloggd)." >&2
+    echo "Faltan csrf_token/cookie_header en keychain (servicio ${SERVICE})." >&2
     exit 1
   fi
 }
@@ -36,10 +34,23 @@ require_auth() {
 api_call() {
   local method="$1" endpoint="$2" data="${3:-}"
   require_auth
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[DRY-RUN] $method ${BASE_URL}${endpoint}"
+    [[ -n "$data" ]] && echo "[DRY-RUN] data: $data"
+    return 0
+  fi
+  local resp status body
   if [[ -n "$data" ]]; then
-    curl -s -X "$method" "${BASE_URL}${endpoint}" "${auth_headers[@]}" --data "$data"
+    resp=$(curl -sS -X "$method" "${BASE_URL}${endpoint}" "${auth_headers[@]}" --data "$data" -w $'\n__STATUS__:%{http_code}')
   else
-    curl -s -X "$method" "${BASE_URL}${endpoint}" "${auth_headers[@]}"
+    resp=$(curl -sS -X "$method" "${BASE_URL}${endpoint}" "${auth_headers[@]}" -w $'\n__STATUS__:%{http_code}')
+  fi
+  status=$(printf '%s' "$resp" | awk -F: '/__STATUS__/{print $2}' | tail -1)
+  body=$(printf '%s' "$resp" | sed '/__STATUS__:/d')
+  printf '%s\n' "$body"
+  if [[ -z "$status" || "$status" -ge 400 ]]; then
+    echo "ERROR HTTP ${status:-unknown} en ${endpoint}" >&2
+    return 1
   fi
 }
 
@@ -75,12 +86,11 @@ Uso:
 
   backloggd-mini help
 
-Sort campos típicos:
-  release, title, added, rating, user-rating, popular, trending,
-  time, avg-play-time, avg-finish-time, last_played, shuffle
+Env:
+  BACKLOGGD_MINI_DRY_RUN=1      No ejecuta mutaciones, imprime request
+  BACKLOGGD_MINI_BASE_URL=...   Override host
 
-Status IDs:
-  0=Completed, 2=Abandoned, 3=Retired, 4=Shelved, 5=Played
+Status IDs: 0=Completed, 2=Abandoned, 3=Retired, 4=Shelved, 5=Played
 EOF
 }
 
@@ -88,10 +98,13 @@ csv_to_repeat() {
   local key="$1" csv="$2" out=""
   IFS=',' read -r -a ids <<< "$csv"
   for id in "${ids[@]}"; do
-    [[ -n "$id" ]] && out+="${key}[]=${id}&"
+    id="${id// /}"
+    [[ -n "$id" ]] && out+="${key}[]=$(urlencode "$id")&"
   done
   echo "${out%&}"
 }
+
+kv() { printf '%s=%s' "$1" "$(urlencode "$2")"; }
 
 cmd_backlog() {
   local sort="release" dir="asc"
@@ -103,149 +116,46 @@ cmd_backlog() {
       *) echo "Arg no reconocido: $1" >&2; exit 1 ;;
     esac
   done
-
-  [[ -z "${USERNAME}" ]] && { echo "Falta username en keychain (backloggd/username)." >&2; exit 1; }
-
-  local path="/u/${USERNAME}/backlog/${sort}/"
-  [[ "$dir" == "asc" ]] && path="/u/${USERNAME}/backlog/${sort}:asc/"
+  [[ -z "${USERNAME}" ]] && { echo "Falta username en keychain (${SERVICE}/username)." >&2; exit 1; }
+  local path="/u/${USERNAME}/backlog/${sort}/"; [[ "$dir" == "asc" ]] && path="/u/${USERNAME}/backlog/${sort}:asc/"
 
   python3 - "${BASE_URL}${path}" <<'PY'
 import sys,re,html,urllib.request
-url=sys.argv[1]
-src=urllib.request.urlopen(url, timeout=30).read().decode('utf-8','ignore')
+src=urllib.request.urlopen(sys.argv[1], timeout=30).read().decode('utf-8','ignore')
 pat=re.compile(r'<div class="card mx-auto game-cover [^"]*"[^>]*>.*?<img[^>]*alt="([^"]+)".*?</div>\s*</div>\s*<div class="row mx-0 release-below">\s*<p>([^<]+)</p>',re.S)
-rows=[]
 seen=set()
 for t,d in pat.findall(src):
-    title=html.unescape(t).strip()
-    date=html.unescape(d).strip()
+    title=html.unescape(t).strip(); date=html.unescape(d).strip()
     if title in seen: continue
     seen.add(title)
-    rows.append((date,title))
-for date,title in rows:
     print(f"{date}\t{title}")
 PY
 }
 
-cmd_log() {
-  local game_id="${1:-}" kind="${2:-}"
-  [[ -z "$game_id" || -z "$kind" ]] && { usage; exit 1; }
-  api_call POST "/log/" "type=${kind}&game_id=${game_id}"; echo
-}
+cmd_log(){ [[ $# -lt 2 ]]&&{ usage; exit 1; }; api_call POST "/log/" "$(kv type "$2")&$(kv game_id "$1")"; }
+cmd_unlog(){ [[ $# -lt 1 ]]&&{ usage; exit 1; }; api_call DELETE "/unlog/" "$(kv game_id "$1")"; }
+cmd_set_status(){ [[ $# -lt 2 ]]&&{ usage; exit 1; }; api_call PATCH "/log/status/" "$(kv game_id "$1")&$(kv status_id "$2")"; }
+cmd_rate(){ [[ $# -lt 2 ]]&&{ usage; exit 1; }; api_call POST "/rate/$1" "$(kv rating "$2")"; }
+cmd_unrate(){ [[ $# -lt 1 ]]&&{ usage; exit 1; }; api_call DELETE "/delete-rating/" "$(kv game_id "$1")"; }
 
-cmd_unlog() {
-  local game_id="${1:-}"
-  [[ -z "$game_id" ]] && { usage; exit 1; }
-  api_call DELETE "/unlog/" "game_id=${game_id}"; echo
-}
+cmd_list_add(){ [[ $# -lt 2 ]]&&{ usage; exit 1; }; api_call POST "/api/list/quick/$1" "$(csv_to_repeat list_ids "$2")"; }
+cmd_list_create(){ [[ $# -lt 1 ]]&&{ usage; exit 1; }; api_call POST "/api/new-list/" "$(kv name "$1")"; }
+cmd_list_update(){ [[ $# -lt 2 ]]&&{ usage; exit 1; }; api_call PUT "/api/list/" "$(kv list_id "$1")&$(kv name "$2")"; }
+cmd_list_delete(){ [[ $# -lt 1 ]]&&{ usage; exit 1; }; api_call DELETE "/api/list/" "$(kv list_id "$1")"; }
+cmd_list_stats(){ [[ $# -lt 1 ]]&&{ usage; exit 1; }; api_call PUT "/api/list/stats/" "$(kv list_id "$1")"; }
 
-cmd_set_status() {
-  local game_id="${1:-}" status_id="${2:-}"
-  [[ -z "$game_id" || -z "$status_id" ]] && { usage; exit 1; }
-  api_call PATCH "/log/status/" "game_id=${game_id}&status_id=${status_id}"; echo
-}
+cmd_folder_create(){ [[ $# -lt 1 ]]&&{ usage; exit 1; }; api_call POST "/api/list/folder" "$(kv name "$1")"; }
+cmd_folder_delete(){ [[ $# -lt 1 ]]&&{ usage; exit 1; }; api_call DELETE "/api/list/folder" "$(kv folder_id "$1")"; }
+cmd_folder_assign(){ [[ $# -lt 2 ]]&&{ usage; exit 1; }; api_call PUT "/api/list/folder/lists/" "$(kv folder_id "$1")&$(csv_to_repeat list_ids "$2")"; }
 
-cmd_rate() {
-  local game_id="${1:-}" rating="${2:-}"
-  [[ -z "$game_id" || -z "$rating" ]] && { usage; exit 1; }
-  api_call POST "/rate/${game_id}" "rating=${rating}"; echo
-}
+cmd_like_review(){ [[ $# -lt 1 ]]&&{ usage; exit 1; }; api_call POST "/like/" "$(kv id "$1")"; }
+cmd_unlike_review(){ [[ $# -lt 1 ]]&&{ usage; exit 1; }; api_call DELETE "/unlike/" "$(kv id "$1")"; }
+cmd_comment_add(){ [[ $# -lt 2 ]]&&{ usage; exit 1; }; api_call POST "/comment/" "$(kv id "$1")&$(kv content "$2")"; }
+cmd_comment_edit(){ [[ $# -lt 2 ]]&&{ usage; exit 1; }; api_call POST "/comment/edit/" "$(kv comment_id "$1")&$(kv content "$2")"; }
+cmd_comment_delete(){ [[ $# -lt 1 ]]&&{ usage; exit 1; }; api_call DELETE "/comment/destroy/" "$(kv comment_id "$1")"; }
+cmd_report(){ [[ $# -lt 2 ]]&&{ usage; exit 1; }; api_call POST "/report/" "$(kv id "$1")&$(kv reason "$2")"; }
 
-cmd_unrate() {
-  local game_id="${1:-}"
-  [[ -z "$game_id" ]] && { usage; exit 1; }
-  api_call DELETE "/delete-rating/" "game_id=${game_id}"; echo
-}
-
-cmd_list_add() {
-  local game_id="${1:-}" csv="${2:-}"
-  [[ -z "$game_id" || -z "$csv" ]] && { usage; exit 1; }
-  local data
-  data="$(csv_to_repeat list_ids "$csv")"
-  api_call POST "/api/list/quick/${game_id}" "$data"; echo
-}
-
-cmd_list_create() {
-  local name="${1:-}"
-  [[ -z "$name" ]] && { usage; exit 1; }
-  api_call POST "/api/new-list/" "name=${name}"; echo
-}
-
-cmd_list_update() {
-  local list_id="${1:-}" name="${2:-}"
-  [[ -z "$list_id" || -z "$name" ]] && { usage; exit 1; }
-  api_call PUT "/api/list/" "list_id=${list_id}&name=${name}"; echo
-}
-
-cmd_list_delete() {
-  local list_id="${1:-}"
-  [[ -z "$list_id" ]] && { usage; exit 1; }
-  api_call DELETE "/api/list/" "list_id=${list_id}"; echo
-}
-
-cmd_list_stats() {
-  local list_id="${1:-}"
-  [[ -z "$list_id" ]] && { usage; exit 1; }
-  api_call PUT "/api/list/stats/" "list_id=${list_id}"; echo
-}
-
-cmd_folder_create() {
-  local name="${1:-}"
-  [[ -z "$name" ]] && { usage; exit 1; }
-  api_call POST "/api/list/folder" "name=${name}"; echo
-}
-
-cmd_folder_delete() {
-  local folder_id="${1:-}"
-  [[ -z "$folder_id" ]] && { usage; exit 1; }
-  api_call DELETE "/api/list/folder" "folder_id=${folder_id}"; echo
-}
-
-cmd_folder_assign() {
-  local folder_id="${1:-}" csv="${2:-}"
-  [[ -z "$folder_id" || -z "$csv" ]] && { usage; exit 1; }
-  local data
-  data="folder_id=${folder_id}&$(csv_to_repeat list_ids "$csv")"
-  api_call PUT "/api/list/folder/lists/" "$data"; echo
-}
-
-cmd_like_review() {
-  local review_id="${1:-}"
-  [[ -z "$review_id" ]] && { usage; exit 1; }
-  api_call POST "/like/" "id=${review_id}"; echo
-}
-
-cmd_unlike_review() {
-  local review_id="${1:-}"
-  [[ -z "$review_id" ]] && { usage; exit 1; }
-  api_call DELETE "/unlike/" "id=${review_id}"; echo
-}
-
-cmd_comment_add() {
-  local review_id="${1:-}" text="${2:-}"
-  [[ -z "$review_id" || -z "$text" ]] && { usage; exit 1; }
-  api_call POST "/comment/" "id=${review_id}&content=${text}"; echo
-}
-
-cmd_comment_edit() {
-  local comment_id="${1:-}" text="${2:-}"
-  [[ -z "$comment_id" || -z "$text" ]] && { usage; exit 1; }
-  api_call POST "/comment/edit/" "comment_id=${comment_id}&content=${text}"; echo
-}
-
-cmd_comment_delete() {
-  local comment_id="${1:-}"
-  [[ -z "$comment_id" ]] && { usage; exit 1; }
-  api_call DELETE "/comment/destroy/" "comment_id=${comment_id}"; echo
-}
-
-cmd_report() {
-  local review_id="${1:-}" reason="${2:-}"
-  [[ -z "$review_id" || -z "$reason" ]] && { usage; exit 1; }
-  api_call POST "/report/" "id=${review_id}&reason=${reason}"; echo
-}
-
-main() {
+main(){
   local cmd="${1:-help}"; shift || true
   case "$cmd" in
     backlog) cmd_backlog "$@" ;;
@@ -254,24 +164,20 @@ main() {
     set-status) cmd_set_status "$@" ;;
     rate) cmd_rate "$@" ;;
     unrate) cmd_unrate "$@" ;;
-
     list-add) cmd_list_add "$@" ;;
     list-create) cmd_list_create "$@" ;;
     list-update) cmd_list_update "$@" ;;
     list-delete) cmd_list_delete "$@" ;;
     list-stats) cmd_list_stats "$@" ;;
-
     folder-create) cmd_folder_create "$@" ;;
     folder-delete) cmd_folder_delete "$@" ;;
     folder-assign) cmd_folder_assign "$@" ;;
-
     like-review) cmd_like_review "$@" ;;
     unlike-review) cmd_unlike_review "$@" ;;
     comment-add) cmd_comment_add "$@" ;;
     comment-edit) cmd_comment_edit "$@" ;;
     comment-delete) cmd_comment_delete "$@" ;;
     report) cmd_report "$@" ;;
-
     help|-h|--help) usage ;;
     *) echo "Comando desconocido: $cmd" >&2; usage; exit 1 ;;
   esac
