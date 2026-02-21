@@ -1,32 +1,35 @@
 ---
 name: backloggd
-description: "Reverse-engineered Backloggd REST endpoints (authenticated and public) using browser session + direct HTTP calls. Use for watchlist/log/list interactions and lightweight automation."
+description: "Backloggd (no oficial): endpoints REST reverse-engineered para consultar y automatizar acciones de colección, backlog, logs y listas."
 ---
 
-# Backloggd (Reverse-engineered REST API)
+# Backloggd (Reverse-engineered API)
 
-Ingeniería inversa sobre `backloggd.com` desde sesión activa en navegador.
+Backloggd no publica API oficial. Este skill documenta endpoints detectados en frontend + pruebas reales.
 
 ## Base
 
-- **Web:** `https://backloggd.com`
-- **API style:** endpoints REST-ish bajo `/api/...` + endpoints auxiliares (`/log/`, `/rate/`, etc.)
-- **Auth real:** cookie de sesión del navegador + CSRF token en requests mutantes
+- Host: `https://backloggd.com`
+- Estilo: mezcla de rutas `/api/...` y rutas funcionales (`/log/`, `/rate/:id`, etc.)
+- Auth: sesión web (cookies) + CSRF para mutaciones
 
-## Secretos en Keychain (local)
+## Credenciales/sesión en Keychain
 
-- `security find-generic-password -s backloggd -a username -w`
-- `security find-generic-password -s backloggd -a csrf_token -w`
-- `security find-generic-password -s backloggd -a cookie_header -w`
+- `backloggd/username`
+- `backloggd/csrf_token`
+- `backloggd/cookie_header`
 
-> Nota: `cookie_header`/`csrf_token` pueden caducar. Si fallan (401/403/422), recaptúralos desde navegador.
-
-## Headers base para llamadas autenticadas
+Leer:
 
 ```bash
+USER=$(security find-generic-password -s backloggd -a username -w)
 CSRF=$(security find-generic-password -s backloggd -a csrf_token -w)
 COOKIE=$(security find-generic-password -s backloggd -a cookie_header -w)
+```
 
+Headers reutilizables:
+
+```bash
 AUTH_HEADERS=(
   -H "X-CSRF-Token: $CSRF"
   -H "Cookie: $COOKIE"
@@ -36,37 +39,79 @@ AUTH_HEADERS=(
 )
 ```
 
-## Endpoints confirmados (bundle JS + runtime)
+---
 
-### Públicos / lectura
+## 1) Ver backlog ordenado por campos (lo más útil)
 
-- `GET /api/daily-tip/` ✅ devuelve JSON
-- `POST /games/render/` (filtros)
+Backloggd permite ordenar por URL en el perfil:
+
+Base:
+
+```bash
+https://backloggd.com/u/$USER/backlog/<campo>/
+https://backloggd.com/u/$USER/backlog/<campo>:asc/
+```
+
+Campos detectados:
+
+- `added`
+- `release`
+- `title`
+- `rating`
+- `user-rating`
+- `popular`
+- `trending`
+- `time`
+- `avg-play-time`
+- `avg-finish-time`
+- `last_played`
+- `shuffle`
+
+### Ejemplo: backlog por fecha de lanzamiento ASC
+
+```bash
+USER=$(security find-generic-password -s backloggd -a username -w)
+
+curl -s "https://backloggd.com/u/$USER/backlog/release:asc/" | \
+python3 - <<'PY'
+import sys,re,html
+src=sys.stdin.read()
+for title in re.findall(r'<img[^>]*alt="([^"]+)"', src):
+    print(html.unescape(title))
+PY
+```
+
+### Ejemplo: backlog por título ASC
+
+```bash
+curl -s "https://backloggd.com/u/$USER/backlog/title:asc/"
+```
+
+---
+
+## 2) Endpoints confirmados por acciones
+
+## Lectura / render
+
+- `GET /api/daily-tip/`
+- `POST /games/render/` (discovery con filtros serializados)
+- `GET /library/get/:game_id`
+- `GET /library/render/` (render de entrada librería)
 - `GET /genres/fetch/all/`
 - `GET /platforms/fetch/all/`
-- `GET /library/get/`
-- `GET /library/render/`
-- `GET /stats/`, `GET /stats/game/`
 
-### Usuario / logs / ratings
+## Logs / estado / rating
 
-- `POST /log/` (alta de estado, p.ej. wishlist)
+- `POST /log/`
+  - ejemplo: marcar como wishlist o played
 - `PATCH /log/status/`
+  - cambia estado (`status_id`)
 - `DELETE /unlog/`
-- `POST /rate/`
+- `POST /rate/:game_id`
 - `DELETE /delete-rating/`
-- `POST /api/user/games/logs` (batch info de logs)
-- `PATCH /user/log/resolve-merge`
+- `POST /api/user/games/logs` (batch de info de logs)
 
-### Likes / reviews / social
-
-- `POST /api/user/reviews/likes` (`ids[]`)
-- `POST /like/` / `DELETE /unlike/`
-- `POST /like/game/` / `DELETE /unlike/game/`
-- `POST /report/` / `PATCH /report/status/`
-- `POST /comment/`, `POST /comment/edit/`, `DELETE /comment/destroy/`
-
-### Listas / carpetas
+## Listas / carpetas
 
 - `POST /api/new-list/`
 - `POST /api/list/`
@@ -79,63 +124,112 @@ AUTH_HEADERS=(
 - `DELETE /api/list/folder`
 - `PUT /api/list/folder/lists/`
 
-### Widgets
+## Social
+
+- `POST /api/user/reviews/likes` (con `ids`)
+- `POST /like/` / `DELETE /unlike/`
+- `POST /like/game/` / `DELETE /unlike/game/`
+- `POST /comment/`, `POST /comment/edit/`, `DELETE /comment/destroy/`
+- `POST /report/`, `PATCH /report/status/`
+
+## Widgets
 
 - `POST /widget/load/`
 - `GET /widget/render/`
 - `GET /widget/settings/render/`
 - `POST /widget/set/`
 
-## Ejemplos rápidos
+---
 
-### Tip diario
+## 3) Ejemplos claros de acciones
+
+### A) Crear lista nueva
 
 ```bash
-curl -s "https://backloggd.com/api/daily-tip/"
+curl -s -X POST "https://backloggd.com/api/new-list/" "${AUTH_HEADERS[@]}"
 ```
 
-### Crear lista nueva
+### B) Añadir juego a varias listas (quick add)
 
 ```bash
-curl -s "https://backloggd.com/api/new-list/" \
-  -X POST \
-  "${AUTH_HEADERS[@]}"
-```
-
-### Añadir juego a listas rápidas
-
-```bash
-GAME_ID=12345
-LIST_IDS="1,2"
-
-curl -s "https://backloggd.com/api/list/quick/$GAME_ID" \
-  -X POST \
+GAME_ID=25076
+# form-encoded repetido: list_ids[]=1&list_ids[]=2
+curl -s -X POST "https://backloggd.com/api/list/quick/$GAME_ID" \
   "${AUTH_HEADERS[@]}" \
-  --data "list_ids[]=${LIST_IDS//,/&list_ids[]=}"
+  --data "list_ids[]=1&list_ids[]=2"
 ```
 
-### Cambiar estado de log
+### C) Marcar juego como played (crea log tipo play)
 
 ```bash
-GAME_ID=12345
-STATUS_ID=2
+GAME_ID=25076
+curl -s -X POST "https://backloggd.com/log/" \
+  "${AUTH_HEADERS[@]}" \
+  --data "type=play&game_id=$GAME_ID"
+```
 
-curl -s "https://backloggd.com/log/status/" \
-  -X PATCH \
+### D) Cambiar estado de log
+
+```bash
+GAME_ID=25076
+STATUS_ID=2
+curl -s -X PATCH "https://backloggd.com/log/status/" \
   "${AUTH_HEADERS[@]}" \
   --data "game_id=$GAME_ID&status_id=$STATUS_ID"
 ```
 
-## Método de reverse engineering usado
+### E) Puntuar juego
 
-1. Sesión ya iniciada en navegador.
-2. Inspección de recursos y JS bundle (`application-*.js`).
-3. Extracción de `type + url` en llamadas `ajax`.
-4. Verificación de endpoints con `fetch/curl`.
-5. Guardado de datos sensibles mínimos en Keychain.
+```bash
+GAME_ID=25076
+RATING=4.5
+curl -s -X POST "https://backloggd.com/rate/$GAME_ID" \
+  "${AUTH_HEADERS[@]}" \
+  --data "rating=$RATING"
+```
 
-## Limitaciones
+### F) Ver likes del usuario para reviews concretas
 
-- API no oficial → puede romper sin aviso.
-- Parte del auth depende de cookie de sesión web (no token API estable).
-- Algunos endpoints requieren payload exacto/contexto UI para funcionar.
+```bash
+curl -s -X POST "https://backloggd.com/api/user/reviews/likes" \
+  "${AUTH_HEADERS[@]}" \
+  --data "ids[]=123&ids[]=456"
+```
+
+---
+
+## 4) Filtros de backlog (formato URL)
+
+El frontend serializa filtros y los añade a la URL tras el sort.
+Ejemplo conceptual:
+
+```text
+/u/<user>/backlog/release:asc/<serialized_filters>/
+```
+
+Valores detectados en formularios:
+
+- `filters[genre]`
+- `filters[category]`
+- `filters[release_platform]`
+- `filters[played_platform]`
+- `filters[played_on_platform]`
+- `filters[game_status]`
+- `filters[game_ownership]`
+- toggles como `filters[covers]`, `filters[mastered]`, etc.
+
+---
+
+## 5) Troubleshooting
+
+- **401/403**: cookie o CSRF caducados → recapturar desde pestaña logueada.
+- **422**: payload inválido o falta header CSRF.
+- **200 HTML en vez de JSON**: endpoint no-API o sesión no válida.
+
+---
+
+## 6) Seguridad
+
+- Nunca guardar cookies/tokens en texto plano en repo.
+- Guardar en Keychain y refrescar cuando caduquen.
+- Esta API no es oficial: puede romper sin aviso.
