@@ -264,14 +264,12 @@ backloggd-mini list-add <game_id> <list_ids_csv>
 Cobertura vs skill:
 
 - ✅ Backlog ordenado por campo
-- ✅ Crear logs básicos (`wishlist|backlog|playing|play`)
-- ✅ Cambiar estado de log
-- ✅ Puntuar juego
-- ✅ Quick add a listas
-- ❌ Crear/editar/borrar listas completas (`/api/list`)
-- ❌ Carpetas de listas (`/api/list/folder`)
-- ❌ Social (likes, comments, report)
-- ❌ Widgets
+- ✅ Logs: crear, cambiar estado, borrar
+- ✅ Ratings: crear y borrar
+- ✅ Listas: quick add + create/update/delete + stats
+- ✅ Carpetas: create/delete/assign listas
+- ✅ Social base: like/unlike review, comment add/edit/delete, report
+- ❌ Widgets (load/render/settings/set)
 
 ## 7) Seguridad
 
